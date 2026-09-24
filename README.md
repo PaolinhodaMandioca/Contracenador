@@ -1,2 +1,2 @@
 # Contracenador
-Codigo capag de gerir dois atores(agentes de ia) para conversarem entre si para gerar algumresultado
+Codigo capaz de gerir dois atores(agentes de ia) para conversarem entre si para gerar algum resultado
