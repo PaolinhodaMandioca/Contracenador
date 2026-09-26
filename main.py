@@ -1,68 +1,207 @@
 """
 main.py - o terminal do projeto e o ORQUESTRADOR.
 
-O orquestrador é o "carteiro": pega o envelope de fala de um agente e entrega ao outro.
-Os agentes nunca abrem o arquivo .db um do outro, nunca veem o prompt um do outro e só
+O orquestrador é o "carteiro": pega o envelope de fala de um Ator e entrega ao outro.
+Os atores nunca abrem o arquivo .db um do outro, nunca veem o prompt um do outro e só
 trocam o que está dentro do envelope. É isso que garante o isolamento.
 
 Uso:
-    1) llama-server -m SEU-MODELO-3B.gguf -c 4096 -np 2 -t 8 --port 8080
-    2) python main.py --slots 2
+    python main.py
+
+    Ao iniciar, sobe automaticamente o llama-server com o modelo 7B (atores).
+    Quando /roteiro é chamado, derruba o 7B, sobe o 14B para gerar a cena, e depois
+    volta ao 7B — tudo transparente para o usuário.
+
+    Para personalizar os modelos ou portas use as flags abaixo:
+    python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+                   --modelo-roteirista Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M
 """
 import argparse
+import json
 import os
 import random
 import re
+import socket
+import subprocess
 import sys
+import time
 
-from agente import Agente, TRACOS_PADRAO, criar_agente, limitar, normalizar
+from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar, normalizar
 from llm import LLM
+from roteirista import gerar_cena_llm, materializar_cena
+
+
+# ============================================================================
+# 0) GERENCIADOR DE SERVIDOR llama-server
+# ============================================================================
+
+class GerenciadorServidor:
+    """
+    Sobe e derruba um processo llama-server automaticamente.
+
+    Dois modos de carregamento de modelo:
+      - Hugging Face: modelo = "Org/Repo:arquivo.gguf"  (flag -hf)
+      - Local:        modelo = "/caminho/para/modelo.gguf" (flag -m)
+
+    Detecta qual usar pelo conteúdo de `modelo`:
+      - se termina em .gguf → local (-m)
+      - se contém "/" ou ":" → Hugging Face (-hf)
+    """
+
+    # Modelos padrão sugeridos (pode substituir via --modelo-atores / --modelo-roteirista)
+    MODELO_ATORES      = "Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M"
+    MODELO_ROTEIRISTA  = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
+
+    def __init__(self, modelo, porta, slots=2, contexto=4096, threads=None):
+        self.modelo   = modelo
+        self.porta    = porta
+        self.slots    = slots
+        self.contexto = contexto
+        self.threads  = threads   # None = llama-server decide sozinho
+        self._proc    = None
+
+    # ------------------------------------------------------------------
+    # API pública
+    # ------------------------------------------------------------------
+
+    def subir(self):
+        """Inicia o llama-server e aguarda o servidor ficar pronto."""
+        if self._proc and self._proc.poll() is None:
+            return  # já está rodando
+
+        cmd = self._montar_cmd()
+        print(f"\n[servidor] Subindo: {' '.join(cmd)}")
+        # creationflags=CREATE_NEW_PROCESS_GROUP permite matar o processo
+        # filho sem matar o Python (Windows).
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        self._aguardar_pronto()
+
+    def derrubar(self):
+        """Para o processo llama-server, se estiver em execução."""
+        if self._proc is None:
+            return
+        if self._proc.poll() is None:
+            print(f"[servidor] Encerrando servidor na porta {self.porta}...")
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+
+    def url(self):
+        return f"http://127.0.0.1:{self.porta}"
+
+    def em_execucao(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    # ------------------------------------------------------------------
+    # Internos
+    # ------------------------------------------------------------------
+
+    def _montar_cmd(self):
+        modelo = self.modelo.strip()
+        # Decide -hf (Hugging Face) ou -m (arquivo local)
+        if modelo.endswith(".gguf"):
+            flag_modelo = ["-m", modelo]
+        else:
+            flag_modelo = ["-hf", modelo]
+
+        cmd = (
+            ["llama-server"]
+            + flag_modelo
+            + ["-c", str(self.contexto),
+               "-np", str(self.slots),
+               "--port", str(self.porta)]
+        )
+        if self.threads:
+            cmd += ["-t", str(self.threads)]
+        return cmd
+
+    def _aguardar_pronto(self, tentativas=120, intervalo=2.0):
+        """
+        Faz polling no endpoint /health do llama-server.
+        Aguarda até `tentativas * intervalo` segundos (padrão: 4 minutos).
+        O 14B pode demorar para carregar em CPU — não reduza muito.
+        """
+        import urllib.request, urllib.error
+        url_health = f"{self.url()}/health"
+        print(f"[servidor] Aguardando o modelo carregar na porta {self.porta}", end="", flush=True)
+        for _ in range(tentativas):
+            time.sleep(intervalo)
+            print(".", end="", flush=True)
+            if self._proc.poll() is not None:
+                print()
+                raise RuntimeError("O llama-server encerrou antes de ficar pronto. "
+                                   "Verifique se o modelo existe e se há RAM suficiente.")
+            try:
+                with urllib.request.urlopen(url_health, timeout=3) as r:
+                    dados = json.load(r)
+                    if dados.get("status") in ("ok", "loading model"):
+                        # "loading model" = servidor no ar, ainda carregando;
+                        # continuamos esperando até status == "ok"
+                        if dados.get("status") == "ok":
+                            print(f"\n[servidor] Pronto! ({self.modelo})")
+                            return
+            except Exception:
+                pass  # porta ainda não abriu — tenta de novo
+        print()
+        raise RuntimeError(f"Tempo esgotado aguardando o llama-server na porta {self.porta}.")
+
 
 AJUDA = """
-Comandos (qualquer outro texto é uma mensagem para o agente atual):
-  /agentes                    lista os agentes
-  /falar <nome>               troca o agente com quem você conversa
-  /lembrar <texto>            ensina um fato ao agente atual
-  /memorias                   mostra o que o agente atual sabe
+Comandos (qualquer outro texto é uma mensagem para o ator atual):
+  /cenario                    mostra o incidente e os personagens do cenário atual
+  /cena [rodadas]             inicia a encenação na sala (investigador interroga até descobrir)
+  /roteiro [tema]             cria uma nova cena com 5 atores usando a IA (LLM)
+  /atores                     lista os atores carregados
+  /falar <nome>               troca o ator com quem você conversa
+  /lembrar <texto>            ensina um fato ao ator atual
+  /memorias                   mostra o que o ator atual sabe
   /falsa <id> <texto>         escreve à mão a versão falsa da memória <id> (a que ele conta ao mentir)
-  /sobre <id> <nome>          diz de quem é a memória <id> (ex.: /sobre 3 Bia); sem nome remove
-  /estado                     mostra traços, emoções e relações do agente atual
-  /tracos <traco> <0 a 1>     muda um traço do agente atual (ex.: /tracos honestidade 0.2)
-  /novo <nome>                cria um agente novo (um arquivo .db novo)
-  /conversar <A> <B> <tópico> faz A e B conversarem entre si sobre o tópico
-  /turnos <N>                 quantas falas tem a conversa entre agentes (padrão 4)
+  /sobre <id> <nome>          diz de quem é a memória <id> (ex.: /sobre 3 Marcos); sem nome remove
+  /estado                     mostra traços, emoções e relações do ator atual
+  /tracos <traco> <0 a 1>     muda um traço do ator atual (ex.: /tracos honestidade 0.2)
+  /novo <nome>                cria um ator novo avulso (um arquivo .db novo)
+  /conversar <A> <B> <tópico> faz A e B conversarem entre si sobre o tópico (1 para 1)
+  /turnos <N>                 quantas falas tem a conversa entre 2 atores (padrão 4)
   /ajuda   /sair
 """
 
 
 # ============================================================================
-# 1) AGENTES: carregar do disco e criar os de exemplo
+# 1) ATORES E CENÁRIO: carregar do disco
 # ============================================================================
 
-def criar_exemplos(pasta):
-    """Na primeira execução cria dois agentes opostos, para dar o que testar."""
-    criar_agente(
-        os.path.join(pasta, "bia.db"), "Bia",
-        "Simpática, curiosa e muito falante. Fala com frases curtas e gírias leves.",
-        ["Opa, essa eu não sabia! Me conta mais?", "Nossa, sério? Conta tudo!"],
-        {"honestidade": 0.9, "dissimulacao": 0.1, "empatia": 0.8,
-         "coragem": 0.4, "agressividade": 0.1, "ganancia": 0.3})
-    criar_agente(
-        os.path.join(pasta, "caio.db"), "Caio",
-        "Reservado, desconfiado e calculista. Fala pouco, com frases secas e um tom irônico.",
-        ["Hm. E por que eu te contaria isso?", "Depende. O que eu ganho com isso?"],
-        {"honestidade": 0.3, "dissimulacao": 0.8, "empatia": 0.2,
-         "coragem": 0.7, "agressividade": 0.6, "ganancia": 0.7})
-
-
-def carregar_agentes(pasta, slots):
-    """Cada arquivo .db da pasta é um agente. Cada um recebe um slot fixo do servidor
-    (os slots se repetem se houver mais agentes que slots)."""
-    agentes = {}
+def carregar_atores(pasta, slots):
+    """Cada arquivo .db da pasta é um Ator. Cada um recebe um slot fixo do servidor
+    (os slots se repetem se houver mais atores que slots)."""
+    atores = {}
+    if not os.path.exists(pasta):
+        return atores
     for i, arquivo in enumerate(sorted(f for f in os.listdir(pasta) if f.endswith(".db"))):
-        agente = Agente(os.path.join(pasta, arquivo), slot=i % slots)
-        agentes[agente.nome.lower()] = agente
-    return agentes
+        ator = Ator(os.path.join(pasta, arquivo), slot=i % slots)
+        atores[ator.nome.lower()] = ator
+    return atores
+
+
+def carregar_cenario(pasta_cenario):
+    caminho = os.path.join(pasta_cenario, "cena.json")
+    if os.path.exists(caminho):
+        try:
+            with open(caminho, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 # ============================================================================
@@ -86,31 +225,94 @@ def pedir_numero(pergunta, padrao):
 
 def detectar_sujeito(texto, nomes):
     """
-    Acha, dentro do texto, o nome de um agente conhecido - ignora acento/maiúscula e
+    Acha, dentro do texto, o nome de um ator conhecido - ignora acento/maiúscula e
     respeita fronteira de palavra (então 'Bianca' não casa com 'Bia'). Devolve o nome
-    (na grafia original) se achar exatamente um; None se não achar ou achar mais de um
-    (nesse caso é mais seguro perguntar do que adivinhar errado).
+    (na grafia original) se achar exatamente um; None se não achar ou achar mais de um.
     """
     alvo = normalizar(texto)
     achados = [nome for nome in nomes if re.search(rf"\b{re.escape(normalizar(nome))}\b", alvo)]
     return achados[0] if len(achados) == 1 else None
 
 
-def cmd_lembrar(agente, texto, llm, agentes):
+def cmd_cenario(pasta_cenario):
+    dados = carregar_cenario(pasta_cenario)
+    if not dados:
+        print(f"   Nenhum cenário salvo em '{pasta_cenario}/cena.json'. Use /roteiro para criar um.")
+        return
+    print("\n=== Cenário Atual ===")
+    print(f"Incidente: {dados.get('cena', 'Sem descrição')}")
+    atores = dados.get("atores", [])
+    investigador = next((a for a in atores if a.get("papel") == "investigador"), None)
+    if investigador:
+        print(f"Investigador(a): {investigador['nome']} (Objetivo: {investigador.get('objetivo', 'Descobrir a verdade')})")
+    nomes_atores = ", ".join(a["nome"] for a in atores)
+    print(f"Personagens na cena: {nomes_atores}")
+    print(f"(Configurações completas salvas em '{pasta_cenario}/cena.json')")
+
+
+def cmd_roteiro(srv_atores, srv_roteirista, resto, pasta_atores, pasta_cenario, slots, atores_atuais):
+    """
+    Gera uma nova cena com o Roteirista (14B, 100% via LLM) e recarrega os atores (7B).
+    Fluxo com RAM apertada:
+      1) Derruba o servidor 7B (atores)
+      2) Sobe o servidor 14B (roteirista)
+      3) Gera a cena
+      4) Derruba o 14B
+      5) Sobe novamente o 7B
+    """
+    tema = resto.strip()
+    if not tema:
+        print("\n=== Novo Roteiro com IA (modelo 14B) ===")
+        tema = input("Digite o tema ou incidente da cena a ser criada pelo modelo:\n> ").strip()
+        if not tema:
+            print("Operação cancelada: informe um tema para gerar a cena.")
+            return atores_atuais
+
+    for ator in atores_atuais.values():
+        ator.db.close()
+
+    try:
+        # Troca de modelos
+        print("\n[roteiro] Carregando modelo do Roteirista (14B)...")
+        srv_atores.derrubar()
+        srv_roteirista.subir()
+
+        llm_roteirista = LLM(srv_roteirista.url())
+        dados = gerar_cena_llm(llm_roteirista, tema)
+        materializar_cena(dados, pasta_atores=pasta_atores, pasta_cenario=pasta_cenario, slots=slots)
+
+        print("\n[roteiro] Voltando ao modelo dos atores (7B)...")
+        srv_roteirista.derrubar()
+        srv_atores.subir()
+
+        novos_atores = carregar_atores(pasta_atores, slots)
+        print(f"\nCena pronta! Atores carregados: {', '.join(a.nome for a in novos_atores.values())}")
+        return novos_atores
+    except Exception as e:
+        print(f"\n[Erro ao gerar roteiro via LLM] {e}")
+        # Garante que o servidor dos atores volte mesmo com erro
+        if not srv_atores.em_execucao():
+            try:
+                srv_atores.subir()
+            except Exception as e2:
+                print(f"[Erro ao reativar servidor de atores] {e2}")
+        return carregar_atores(pasta_atores, slots)
+
+
+def cmd_lembrar(ator, texto, llm, atores):
     """Salvar é explícito (/lembrar): confiável e não gasta CPU com o modelo."""
     if not texto:
         print("Uso: /lembrar <texto>")
         return
     sens = pedir_numero("   Sensibilidade, de 0 (qualquer um pode saber) a 1 (segredo) [0.3]: ", 0.3)
-    pode = input("   Pode ser contado a outros agentes? (s/n) [s]: ").strip().lower() != "n"
+    pode = input("   Pode ser contado a outros atores? (s/n) [s]: ").strip().lower() != "n"
 
-    # RECONHECIMENTO: se o texto menciona outro agente pelo nome, sugere marcar essa
-    # memória como sendo sobre ele - é isso que permite ao agente atual reconhecer
-    # esse outro agente quando ele aparecer numa conversa (ver sabe_sobre em agente.py).
-    outros = [ag.nome for ag in agentes.values() if ag is not agente]
+    # RECONHECIMENTO: se o texto menciona outro ator pelo nome, sugere marcar essa
+    # memória como sendo sobre ele (ver sabe_sobre em Ator.py).
+    outros = [ag.nome for ag in atores.values() if ag is not ator]
     sugestao = detectar_sujeito(texto, outros)
-    pergunta = (f"   É sobre outro agente? [Enter = {sugestao}, 'n' = nenhum, ou digite outro nome]: "
-                if sugestao else "   É sobre outro agente? (nome, ou Enter para nenhum): ")
+    pergunta = (f"   É sobre outro ator? [Enter = {sugestao}, 'n' = nenhum, ou digite outro nome]: "
+                if sugestao else "   É sobre outro ator? (nome, ou Enter para nenhum): ")
     resposta = input(pergunta).strip()
     if resposta.lower() in ("n", "nao", "não"):
         sobre = None
@@ -119,31 +321,27 @@ def cmd_lembrar(agente, texto, llm, agentes):
     else:
         sobre = sugestao
 
-    id_memoria = agente.lembrar(texto, sensibilidade=sens, compartilhavel=int(pode), sobre=sobre)
+    id_memoria = ator.lembrar(texto, sensibilidade=sens, compartilhavel=int(pode), sobre=sobre)
     print(f"   Salvo (memória #{id_memoria})." + (f" Sobre: {sobre}." if sobre else ""))
 
-    # Se o assunto é outro agente que existe de verdade, ele pode ter estado lá e já
-    # saber disso por conta própria - nesse caso o mesmo fato entra na memória DELE,
-    # como algo que o próprio usuário lhe contou (não como algo que "agente" revelou).
-    alvo = agentes.get(sobre.lower()) if sobre else None
-    if alvo is not None and alvo is not agente:
-        if input(f"   A {alvo.nome} também sabe disso, porque estava lá? (s/n) [n]: ").strip().lower() == "s":
+    alvo = atores.get(sobre.lower()) if sobre else None
+    if alvo is not None and alvo is not ator:
+        if input(f"   A/O {alvo.nome} também sabe disso, porque estava lá? (s/n) [n]: ").strip().lower() == "s":
             alvo.lembrar(texto, sensibilidade=sens, compartilhavel=int(pode))
-            print(f"   Também salvo para a {alvo.nome}.")
+            print(f"   Também salvo para {alvo.nome}.")
 
-    # Só vale gastar uma inferência com a versão falsa se o fato é sensível e pode sair do agente.
     if pode and sens >= 0.5:
         print("   Gerando uma versão falsa para o caso de ele mentir...")
-        falsa = agente.gerar_versao_falsa(id_memoria, llm)
+        falsa = ator.gerar_versao_falsa(id_memoria, llm)
         if falsa:
             print(f"   Versão falsa: {falsa}")
         else:
-            print("   Não consegui gerar uma versão falsa: sem ela o agente só consegue ESCONDER "
+            print("   Não consegui gerar uma versão falsa: sem ela o ator só consegue ESCONDER "
                   "esse fato, não mentir. Escreva uma com /falsa.")
 
 
-def cmd_memorias(agente):
-    memorias = agente.listar_memorias()
+def cmd_memorias(ator):
+    memorias = ator.listar_memorias()
     if not memorias:
         print("   (sem memórias)")
     for m in memorias:
@@ -154,22 +352,22 @@ def cmd_memorias(agente):
               f"{m['texto']}{falsa}")
 
 
-def cmd_falsa(agente, resto):
+def cmd_falsa(ator, resto):
     id_texto = resto.split(maxsplit=1)
-    if len(id_texto) == 2 and id_texto[0].isdigit() and agente.definir_versao_falsa(int(id_texto[0]), id_texto[1]):
+    if len(id_texto) == 2 and id_texto[0].isdigit() and ator.definir_versao_falsa(int(id_texto[0]), id_texto[1]):
         print("   Versão falsa gravada.")
     else:
         print("Uso: /falsa <id da memória> <texto da versão falsa>  (veja os ids em /memorias)")
 
 
-def cmd_sobre(agente, resto):
+def cmd_sobre(ator, resto):
     partes = resto.split(maxsplit=1)
     if not partes or not partes[0].isdigit():
         print("Uso: /sobre <id da memória> <nome>  (sem nome remove; veja os ids em /memorias)")
         return
     id_memoria = int(partes[0])
     nome = partes[1].strip() if len(partes) > 1 else None
-    if not agente.definir_sobre(id_memoria, nome):
+    if not ator.definir_sobre(id_memoria, nome):
         print("   Memória não encontrada (veja os ids em /memorias).")
     elif nome:
         print(f"   Memória #{id_memoria} agora é sobre: {nome}.")
@@ -177,41 +375,41 @@ def cmd_sobre(agente, resto):
         print(f"   Assunto removido da memória #{id_memoria}.")
 
 
-def cmd_tracos(agente, resto):
+def cmd_tracos(ator, resto):
     partes = resto.split()
     if len(partes) == 2 and partes[0] in TRACOS_PADRAO:
         try:
-            agente.pers["tracos"][partes[0]] = limitar(float(partes[1].replace(",", ".")))
-            agente.salvar_personalidade()
-            print(agente.resumo())
+            ator.pers["tracos"][partes[0]] = limitar(float(partes[1].replace(",", ".")))
+            ator.salvar_personalidade()
+            print(ator.resumo())
             return
         except ValueError:
             pass
     print("Uso: /tracos <" + " | ".join(TRACOS_PADRAO) + "> <0 a 1>")
 
 
-def cmd_novo(pasta, nome, agentes, slots):
-    if not nome.isalnum() or nome.lower() in agentes:
+def cmd_novo(pasta, nome, atores, slots):
+    if not nome.isalnum() or nome.lower() in atores:
         print("Use um nome novo, só com letras e números.")
         return
     descricao = input("   Como ele(a) fala e é? (uma frase): ").strip()
     exemplo = input("   Uma frase de exemplo de como ele(a) fala: ").strip()
     tracos = {t: pedir_numero(f"   {t} (0 a 1) [0.5]: ", 0.5) for t in TRACOS_PADRAO}
     caminho = os.path.join(pasta, f"{nome.lower()}.db")
-    criar_agente(caminho, nome.capitalize(), descricao, [exemplo] if exemplo else [], tracos)
-    agentes[nome.lower()] = Agente(caminho, slot=len(agentes) % slots)
-    print(f"   Agente {nome.capitalize()} criado em {caminho}.")
+    criar_ator(caminho, nome.capitalize(), descricao, [exemplo] if exemplo else [], tracos)
+    atores[nome.lower()] = Ator(caminho, slot=len(atores) % slots)
+    print(f"   Ator {nome.capitalize()} criado em {caminho}.")
 
 
-def cmd_conversar(agentes, resto, turnos, llm):
-    """Faz dois agentes conversarem. O orquestrador só leva o envelope de um para o outro."""
+def cmd_conversar(atores, resto, turnos, llm):
+    """Faz dois atores conversarem. O orquestrador só leva o envelope de um para o outro."""
     partes = resto.split(maxsplit=2)
     if len(partes) < 3:
-        print("Uso: /conversar <agente1> <agente2> <tópico>")
+        print("Uso: /conversar <ator1> <ator2> <tópico>")
         return
-    a, b = agentes.get(partes[0].lower()), agentes.get(partes[1].lower())
+    a, b = atores.get(partes[0].lower()), atores.get(partes[1].lower())
     if a is None or b is None or a is b:
-        print("Escolha dois agentes diferentes (veja /agentes).")
+        print("Escolha dois atores diferentes (veja /atores).")
         return
     topico = partes[2]
 
@@ -226,9 +424,145 @@ def cmd_conversar(agentes, resto, turnos, llm):
         envelope = falante.responder(envelope, topico, llm, ultima=(fala == turnos))
     ouvinte.receber(envelope)  # quem ouviu a última fala também precisa processá-la
 
-    print("\n=== Como ficaram os agentes ===")
+    print("\n=== Como ficaram os atores ===")
     print(a.resumo())
     print(b.resumo())
+
+
+def cmd_cena(atores, resto, pasta_cenario, llm):
+    """
+    Orquestra a dinâmica da 'Sala' (Contracenador com 5 atores):
+    - O Investigador interroga um dos outros atores a cada rodada.
+    - O par troca falas (abrir_conversa / responder).
+    - Os outros presentes na sala escutam e processam o que ouviram via .receber(envelope).
+    - Fim dinâmico: a investigação vence se a 'verdade' entrar na memória do investigador;
+      o culpado vence por exaustão se atingir o teto de rodadas (padrão 15).
+    """
+    cenario_dados = carregar_cenario(pasta_cenario)
+    if not cenario_dados:
+        print(f"Nenhum cenário encontrado em '{pasta_cenario}/cena.json'.")
+        print("Crie um cenário primeiro usando: /roteiro")
+        return
+
+    atores_dados = cenario_dados.get("atores", [])
+    investigador_info = next((a for a in atores_dados if a.get("papel") == "investigador"), None)
+    culpado_info = next((a for a in atores_dados if a.get("papel") == "culpado"), None)
+
+    if not investigador_info or not culpado_info:
+        print("Erro: O cenário precisa ter pelo menos 1 investigador e 1 culpado.")
+        return
+
+    investigador = atores.get(investigador_info["nome"].lower())
+    culpado = atores.get(culpado_info["nome"].lower())
+
+    if not investigador or not culpado:
+        print("Erro: Os atores do cenário não estão todos carregados. Use /roteiro para recarregar.")
+        return
+
+    suspeitos = [a for a in atores.values() if a is not investigador]
+    verdade_exata = (culpado_info.get("verdade") or "").strip()
+    topico = investigador_info.get("objetivo") or cenario_dados.get("cena", "O mistério")
+
+    turnos_max = 15
+    if resto.strip().isdigit():
+        turnos_max = max(1, int(resto.strip()))
+
+    print(f"\n{'=' * 65}")
+    print(f"[CENA] A SALA DE INVESTIGAÇÃO")
+    print(f"Incidente: \"{cenario_dados.get('cena')}\"")
+    print(f"Investigador(a): {investigador.nome} | Objetivo: {topico}")
+    print(f"Presentes na sala: {', '.join(a.nome for a in atores.values())}")
+    print(f"Teto de rodadas: {turnos_max}")
+    print(f"{'=' * 65}")
+
+    # Inicializa o contexto de conversa entre o investigador e os outros
+    for s in suspeitos:
+        investigador.nova_conversa(s.nome)
+        s.nova_conversa(investigador.nome)
+
+    vitoria = False
+
+    for rodada in range(1, turnos_max + 1):
+        print(f"\n--- [Rodada {rodada}/{turnos_max}] ---")
+        print(f"Quem {investigador.nome} deve interrogar?")
+        for idx, s in enumerate(suspeitos, 1):
+            desconf = investigador.relacao(s.nome)["desconfianca"]
+            conhece = " (já interrogado)" if s.nome in investigador.satisfeitos else ""
+            print(f"   [{idx}] {s.nome} (desconfiança de {investigador.nome}: {desconf:.2f}){conhece}")
+        print("   [A] Automático (o investigador escolhe sozinho)")
+        print("   [S] Encerrar a cena agora")
+
+        escolha = input("Opção [A]: ").strip().lower()
+
+        if escolha in ("s", "sair", "exit", "q"):
+            print("\nCena encerrada pelo usuário.")
+            break
+
+        alvo = None
+        if escolha.isdigit() and 1 <= int(escolha) <= len(suspeitos):
+            alvo = suspeitos[int(escolha) - 1]
+        elif escolha in ("", "a", "auto", "automatico", "automático"):
+            # Heurística: prioriza quem ainda não foi interrogado e quem tem maior desconfiança
+            alvo = max(
+                suspeitos,
+                key=lambda s: (
+                    investigador.relacao(s.nome)["desconfianca"]
+                    + (0.4 if s.nome not in investigador.satisfeitos else 0.0)
+                    + random.uniform(0.0, 0.2)
+                )
+            )
+            print(f"-> {investigador.nome} decide focar em {alvo.nome}.")
+        else:
+            achados = [s for s in suspeitos if normalizar(s.nome) == normalizar(escolha)]
+            if achados:
+                alvo = achados[0]
+            else:
+                alvo = suspeitos[0]
+                print(f"-> Opção não reconhecida. Focando em {alvo.nome}.")
+
+        print(f"\n[Interrogatório] {investigador.nome} aborda {alvo.nome}...")
+
+        # 1) Investigador fala com o alvo
+        envelope_pergunta = investigador.abrir_conversa(alvo.nome, topico, llm)
+
+        # 2) Alvo responde
+        envelope_resposta = alvo.responder(envelope_pergunta, topico, llm)
+
+        # 3) Investigador processa a resposta
+        investigador.receber(envelope_resposta)
+
+        # 4) Plateia: os outros presentes na sala escutam tudo
+        ouvintes = [a for a in suspeitos if a is not alvo]
+        for ouvinte in ouvintes:
+            ouvinte.receber(envelope_pergunta)
+            ouvinte.receber(envelope_resposta)
+            # Se fatos foram revelados sobre o caso, registra para os ouvintes
+            for fato in envelope_resposta.get("fatos", []):
+                ouvinte.lembrar(fato, origem=alvo.nome, sensibilidade=0.5, sobre=culpado.nome)
+
+        # 5) Fim Dinâmico: checa se a verdade entrou na memória do investigador
+        memorias_inv = [m["texto"].strip() for m in investigador.listar_memorias()]
+        if any(verdade_exata == m or verdade_exata in m for m in memorias_inv):
+            print(f"\n{'*' * 65}")
+            print(f"*** VITÓRIA DA INVESTIGAÇÃO! (Descoberto na rodada {rodada}) ***")
+            print(f"{investigador.nome} conseguiu a confissão da verdade:")
+            print(f"\"{verdade_exata}\"")
+            print(f"{'*' * 65}")
+            vitoria = True
+            break
+
+    if not vitoria and rodada == turnos_max:
+        print(f"\n{'*' * 65}")
+        print(f"*** VITÓRIA DO CULPADO POR EXAUSTÃO! ***")
+        print(f"{culpado.nome} conseguiu despistar {investigador.nome} após {turnos_max} rodadas.")
+        print(f"A verdade que ficou oculta foi:")
+        print(f"\"{verdade_exata}\"")
+        print(f"{'*' * 65}")
+
+    print("\n=== Resumo final dos personagens ===")
+    print(investigador.resumo())
+    print()
+    print(culpado.resumo())
 
 
 # ============================================================================
@@ -236,84 +570,178 @@ def cmd_conversar(agentes, resto, turnos, llm):
 # ============================================================================
 
 def main():
-    analisador = argparse.ArgumentParser(description="Agentes de IA isolados (versão simples)")
-    analisador.add_argument("--url", default="http://127.0.0.1:8080", help="endereço do llama-server")
-    analisador.add_argument("--pasta", default="agentes", help="pasta dos arquivos .db dos agentes")
-    analisador.add_argument("--slots", type=int, default=2,
-                            help="mesmo valor do -np do llama-server (nº de slots)")
-    analisador.add_argument("--semente", type=int, help="fixa o sorteio das decisões (para testes)")
+    analisador = argparse.ArgumentParser(
+        description="Atores de IA isolados com Roteirista (dois modelos, gerenciados automaticamente)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    # Modelos
+    analisador.add_argument(
+        "--modelo-atores",
+        default=GerenciadorServidor.MODELO_ATORES,
+        metavar="MODELO",
+        help=(
+            "Modelo para os atores (7B).\n"
+            "  Hugging Face: Org/Repo:arquivo.gguf  (baixa automaticamente)\n"
+            "  Local:        /caminho/modelo.gguf\n"
+            f"  Padrão: {GerenciadorServidor.MODELO_ATORES}"
+        ),
+    )
+    analisador.add_argument(
+        "--modelo-roteirista",
+        default=GerenciadorServidor.MODELO_ROTEIRISTA,
+        metavar="MODELO",
+        help=(
+            "Modelo para o Roteirista (14B).\n"
+            f"  Padrão: {GerenciadorServidor.MODELO_ROTEIRISTA}"
+        ),
+    )
+    # Portas
+    analisador.add_argument("--porta-atores",      type=int, default=8080, help="Porta do servidor 7B (padrão: 8080)")
+    analisador.add_argument("--porta-roteirista",  type=int, default=8081, help="Porta do servidor 14B (padrão: 8081)")
+    # Outros
+    analisador.add_argument("--slots",   type=int, default=2,  help="Número de slots KV do llama-server (padrão: 2)")
+    analisador.add_argument("--threads", type=int, default=None, help="Número de threads de CPU do llama-server (padrão: automático)")
+    analisador.add_argument("--pasta",   default="atores",  help="Pasta dos arquivos .db dos atores")
+    analisador.add_argument("--cenario", default="cenario", help="Pasta onde o arquivo cena.json é salvo")
+    analisador.add_argument("--semente", type=int,          help="Fixa o sorteio das decisões (para testes)")
     args = analisador.parse_args()
 
     if args.semente is not None:
         random.seed(args.semente)
-    if hasattr(sys.stdout, "reconfigure"):  # evita erro de acento/emoji em terminais antigos
+    if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     os.makedirs(args.pasta, exist_ok=True)
-    if not any(f.endswith(".db") for f in os.listdir(args.pasta)):
-        criar_exemplos(args.pasta)
-        print(f"Primeira execução: criei bia.db e caio.db em '{args.pasta}/'.")
+    os.makedirs(args.cenario, exist_ok=True)
 
-    llm = LLM(args.url)
-    agentes = carregar_agentes(args.pasta, args.slots)
-    atual = next(iter(agentes.values()))
-    turnos = 4
-    print(AJUDA)
+    # Cria os dois gerenciadores (ainda não sobem o processo agora)
+    srv_atores = GerenciadorServidor(
+        modelo=args.modelo_atores,
+        porta=args.porta_atores,
+        slots=args.slots,
+        contexto=4096,
+        threads=args.threads,
+    )
+    srv_roteirista = GerenciadorServidor(
+        modelo=args.modelo_roteirista,
+        porta=args.porta_roteirista,
+        slots=1,        # roteirista gera 1 cena de cada vez: 1 slot basta
+        contexto=8192,  # 14B precisa de contexto maior para gerar JSON longo
+        threads=args.threads,
+    )
 
-    while True:
-        try:
-            entrada = input(f"\n[{atual.nome}] você> ").strip()
-            if not entrada:
-                continue
-            if not entrada.startswith("/"):
-                atual.falar_com_usuario(entrada, llm)
-                continue
+    try:
+        # Sobe o servidor dos atores ao iniciar
+        srv_atores.subir()
+        llm = LLM(srv_atores.url())
 
-            comando, _, resto = entrada.partition(" ")
-            resto = resto.strip()
-            comando = comando.lower()
+        # Se a pasta de atores estiver vazia, aciona o roteirista imediatamente
+        if not any(f.endswith(".db") for f in os.listdir(args.pasta)):
+            print(f"\n[Aviso] Nenhum ator encontrado em '{args.pasta}/'.")
+            print("Vamos gerar uma nova cena com o Roteirista (14B)!")
+            tema = ""
+            while not tema:
+                tema = input("Digite o tema ou incidente da cena:\n> ").strip()
+                if not tema:
+                    print("Por favor, digite um tema para a IA criar o mistério.")
+            try:
+                print("\n[roteiro] Carregando modelo do Roteirista (14B)...")
+                srv_atores.derrubar()
+                srv_roteirista.subir()
+                llm_roteirista = LLM(srv_roteirista.url())
+                dados = gerar_cena_llm(llm_roteirista, tema)
+                materializar_cena(dados, pasta_atores=args.pasta, pasta_cenario=args.cenario, slots=args.slots)
+                print("\n[roteiro] Voltando ao modelo dos atores (7B)...")
+                srv_roteirista.derrubar()
+                srv_atores.subir()
+                llm = LLM(srv_atores.url())
+            except Exception as e:
+                print(f"\n[Erro ao criar cena com LLM] {e}")
+                if not srv_atores.em_execucao():
+                    srv_atores.subir()
+                    llm = LLM(srv_atores.url())
+                sys.exit(1)
 
-            if comando == "/sair":
-                break
-            elif comando == "/ajuda":
-                print(AJUDA)
-            elif comando == "/agentes":
-                for nome, ag in agentes.items():
-                    print(f"   {'*' if ag is atual else ' '} {ag.nome} (slot {ag.slot})")
-            elif comando == "/falar":
-                if resto.lower() in agentes:
-                    atual = agentes[resto.lower()]
+        atores = carregar_atores(args.pasta, args.slots)
+        atual = next(iter(atores.values()))
+        turnos = 4
+        print(AJUDA)
+
+        while True:
+            try:
+                entrada = input(f"\n[{atual.nome}] você> ").strip()
+                if not entrada:
+                    continue
+                if not entrada.startswith("/"):
+                    atual.falar_com_usuario(entrada, llm)
+                    continue
+
+                comando, _, resto = entrada.partition(" ")
+                resto = resto.strip()
+                comando = comando.lower()
+
+                if comando == "/sair":
+                    break
+                elif comando == "/ajuda":
+                    print(AJUDA)
+                elif comando in ("/atores", "/agentes"):
+                    for nome, ag in atores.items():
+                        print(f"   {'*' if ag is atual else ' '} {ag.nome} (slot {ag.slot})")
+                elif comando == "/cenario":
+                    cmd_cenario(args.cenario)
+                elif comando in ("/cena", "/sala"):
+                    cmd_cena(atores, resto, args.cenario, llm)
+                elif comando in ("/roteiro", "/roteirista"):
+                    atores = cmd_roteiro(
+                        srv_atores, srv_roteirista,
+                        resto, args.pasta, args.cenario, args.slots, atores,
+                    )
+                    # Após /roteiro o 7B voltou: recria o cliente LLM apontando para ele
+                    llm = LLM(srv_atores.url())
+                    atual = next(iter(atores.values()))
+                elif comando == "/falar":
+                    if resto.lower() in atores:
+                        atual = atores[resto.lower()]
+                    else:
+                        print("Ator não encontrado (veja /atores).")
+                elif comando == "/lembrar":
+                    cmd_lembrar(atual, resto, llm, atores)
+                elif comando == "/memorias":
+                    cmd_memorias(atual)
+                elif comando == "/falsa":
+                    cmd_falsa(atual, resto)
+                elif comando == "/sobre":
+                    cmd_sobre(atual, resto)
+                elif comando == "/estado":
+                    print(atual.resumo())
+                elif comando == "/tracos":
+                    cmd_tracos(atual, resto)
+                elif comando == "/novo":
+                    cmd_novo(args.pasta, resto, atores, args.slots)
+                elif comando == "/turnos":
+                    turnos = max(1, int(resto)) if resto.isdigit() else turnos
+                    print(f"   Conversas entre atores terão {turnos} falas.")
+                elif comando == "/conversar":
+                    cmd_conversar(atores, resto, turnos, llm)
                 else:
-                    print("Agente não encontrado (veja /agentes).")
-            elif comando == "/lembrar":
-                cmd_lembrar(atual, resto, llm, agentes)
-            elif comando == "/memorias":
-                cmd_memorias(atual)
-            elif comando == "/falsa":
-                cmd_falsa(atual, resto)
-            elif comando == "/sobre":
-                cmd_sobre(atual, resto)
-            elif comando == "/estado":
-                print(atual.resumo())
-            elif comando == "/tracos":
-                cmd_tracos(atual, resto)
-            elif comando == "/novo":
-                cmd_novo(args.pasta, resto, agentes, args.slots)
-            elif comando == "/turnos":
-                turnos = max(1, int(resto)) if resto.isdigit() else turnos
-                print(f"   Conversas entre agentes terão {turnos} falas.")
-            elif comando == "/conversar":
-                cmd_conversar(agentes, resto, turnos, llm)
-            else:
-                print("Comando desconhecido. Digite /ajuda.")
-        except RuntimeError as erro:  # ex.: llama-server desligado
-            print(f"\n[erro] {erro}")
-        except (EOFError, KeyboardInterrupt):
-            break
+                    print("Comando desconhecido. Digite /ajuda.")
+            except RuntimeError as erro:
+                print(f"\n[erro] {erro}")
+            except (EOFError, KeyboardInterrupt):
+                break
 
-    for agente in agentes.values():
-        agente.db.close()  # fecha limpo: os arquivos auxiliares do WAL (-wal/-shm) somem
-    print("\nAté mais!")
+    finally:
+        # Garante que os processos filhos sempre encerrem com o Python
+        _atores_final = locals().get("atores", {})
+        for ator in _atores_final.values():
+            try:
+                ator.db.close()
+            except Exception:
+                pass
+        srv_atores.derrubar()
+        srv_roteirista.derrubar()
+        print("\nAté mais!")
+
 
 
 if __name__ == "__main__":

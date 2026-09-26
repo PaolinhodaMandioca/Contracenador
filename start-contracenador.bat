@@ -1,1 +1,0 @@
-python main.py --slots 2

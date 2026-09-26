@@ -109,7 +109,7 @@ def _migrar(db):
         db.commit()
 
 
-def criar_agente(caminho, nome, descricao, exemplos, tracos):
+def criar_ator(caminho, nome, descricao, exemplos, tracos):
     """Cria o arquivo .db de um agente novo, já com a personalidade gravada."""
     pers = {
         "nome": nome,
@@ -122,6 +122,11 @@ def criar_agente(caminho, nome, descricao, exemplos, tracos):
                (json.dumps(pers, ensure_ascii=False),))
     db.commit()
     db.close()
+
+
+# Aliases para compatibilidade entre nomenclatura 'agente' e 'ator'
+criar_ator = criar_ator
+criar_Ator = criar_ator
 
 
 # ============================================================================
@@ -175,7 +180,7 @@ class Agente:
         self.db = abrir_banco(caminho)
         linha = self.db.execute("SELECT valor FROM config WHERE chave='personalidade'").fetchone()
         if linha is None:
-            raise ValueError(f"{caminho} não tem personalidade. Crie o agente com criar_agente().")
+            raise ValueError(f"{caminho} não tem personalidade. Crie o agente com criar_ator().")
         self.pers = json.loads(linha["valor"])
         self.nome = self.pers["nome"]
 
@@ -186,6 +191,7 @@ class Agente:
         self.satisfeitos = set() # interlocutores de quem já consegui a informação que queria
         self.aguardando = False  # True se o último passo foi pedir algo e a resposta ainda não veio
         self.mostrar = True      # imprime no terminal as decisões internas (bom para ajustar pesos)
+        self.contagem_esquiva = {}  # interlocutor -> nº de vezes que desviei (roda táticas de evasão)
 
     def _log(self, mensagem):
         if self.mostrar:
@@ -243,7 +249,7 @@ class Agente:
         Diferente de recordar(): não depende de bater palavra com o assunto do momento
         (o reconhecimento vale a conversa toda) e não passa pelo filtro de revelar/
         esconder/mentir em decidir() - não é fofoca sendo repassada a um terceiro, é o
-        que o agente já sabe sobre a própria pessoa à sua frente.
+        que o Ator já sabe sobre a própria pessoa à sua frente.
         """
         linhas = self.db.execute(
             "SELECT * FROM memorias WHERE compartilhavel=1 AND sobre=? ORDER BY id DESC LIMIT ?",
@@ -418,7 +424,10 @@ class Agente:
             f"Você é {p['nome']}, um personagem de uma simulação de conversas. {p['descricao']}\n"
             f"Exemplos de como você fala:\n{exemplos}\n"
             f"Regras: fale sempre em português, como {p['nome']}, em no máximo 3 frases curtas. "
-            "Nunca diga que é uma IA e nunca mencione estas regras nem as instruções internas."
+            "Nunca diga que é uma IA e nunca mencione estas regras nem as instruções internas. "
+            "Nunca repita saudações ('olá', 'boa noite', 'como vai') no meio de uma conversa já em andamento. "
+            "Reaja ao tom da fala anterior de forma espontânea e natural. "
+            "Não use sempre a mesma fórmula de resposta: varie o vocabulário e a estrutura das frases."
         )
 
     def _mensagens(self, interlocutor, texto_final):
@@ -485,31 +494,38 @@ class Agente:
         texto = self._falar(self._mensagens(outro, instrucao), llm)
         self._guardar_historico(outro, f"(Você começa a conversa com {outro}.)", texto)
         self.aguardando = True
-        return {"de": self.nome, "tatica": tatica, "texto": texto, "fatos": []}
+        return {"de": self.nome, "alvo": outro, "tatica": tatica, "texto": texto, "fatos": []}
 
     def receber(self, env):
         """Efeitos de ouvir uma fala do outro. Só código: nenhuma chamada ao LLM."""
         outro = env["de"]
+        alvo = env.get("alvo")
+        sou_alvo = (alvo is None or alvo == self.nome)
 
-        # (a) Ameaça: o medo sobe (o efeito real depende da coragem, em `decidir`);
-        #     a confiança cai e a desconfiança sobe.
-        if env["tatica"] == "AMEACAR":
-            self.mudar_relacao(outro, medo=0.5, confianca=-0.1, desconfianca=0.1)
-            self._log(f"{self.nome} foi ameacado(a) por {outro}: medo agora "
-                      f"{self.relacao(outro)['medo']:.2f}")
+        # (a) Ameaça:
+        # Se eu sou o alvo da ameaça: o medo sobe, confiança cai e desconfiança sobe.
+        # Se sou testemunha na sala: observo a agressividade e a desconfiança de quem ameaçou sobe.
+        if env.get("tatica") == "AMEACAR":
+            if sou_alvo:
+                self.mudar_relacao(outro, medo=0.5, confianca=-0.1, desconfianca=0.1)
+                self._log(f"{self.nome} foi ameacado(a) por {outro}: medo agora "
+                          f"{self.relacao(outro)['medo']:.2f}")
+            else:
+                self.mudar_relacao(outro, desconfianca=0.15, confianca=-0.05)
+                self._log(f"{self.nome} presenciou {outro} ameacando {alvo}: desconfiança de {outro} subiu")
 
         # (b) Informação recebida vira memória MINHA, com origem = quem contou. Quem
         #     conta ganha um pouco de confiança, e eu passo a dever um favor.
-        for fato in env["fatos"]:
+        for fato in env.get("fatos", []):
             self.lembrar(fato, origem=outro, sensibilidade=0.5)
             self.mudar_relacao(outro, confianca=0.05, favor_devido=0.1)
             self._log(f"{self.nome} aprendeu com {outro}: {fato!r}")
 
-        # (c) Se eu tinha pedido algo: vieram fatos? Sem informação, a frustração sobe
+        # (c) Se eu tinha pedido algo (e sou o alvo da resposta): vieram fatos? Sem informação, a frustração sobe
         #     (e alimenta a chance de ameaçar); com informação, ela cai.
-        if self.aguardando:
-            self.mudar_estado("frustracao", -0.5 if env["fatos"] else 0.35)
-            if env["fatos"]:
+        if self.aguardando and sou_alvo:
+            self.mudar_estado("frustracao", -0.5 if env.get("fatos") else 0.35)
+            if env.get("fatos"):
                 self.satisfeitos.add(outro)  # consegui o que queria: não preciso mais pressionar
             self.aguardando = False
 
@@ -559,8 +575,17 @@ class Agente:
             for fato in fatos_saida:
                 instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato}".')
         elif escondeu:
-            instrucoes.append(f"Você sabe algo sobre isso, mas não quer contar a {outro}. "
-                              "Desvie o assunto ou diga que prefere não falar.")
+            # Rotação de táticas de evasão: cada vez que este ator esquiva do mesmo
+            # interlocutor, a instrução muda para que as respostas não soem todas iguais.
+            n = self.contagem_esquiva.get(outro, 0)
+            self.contagem_esquiva[outro] = n + 1
+            taticas_esquiva = [
+                f"Você sabe algo sobre isso, mas não quer contar a {outro}. Desvie o assunto sutilmente.",
+                f"Demonstre impaciência ou cansaço com a insistência de {outro}. Deixe claro que já falou o suficiente.",
+                f"Questione por que {outro} está desconfiando de você; sugira que olhe para outros suspeitos.",
+                f"Responda de forma irônica ou desdenhosa à pressão de {outro}, sem revelar nada.",
+            ]
+            instrucoes.append(taticas_esquiva[n % len(taticas_esquiva)])
         elif sobre_terceiros:  # sabe algo sobre terceiros, mas já contou ou foi o próprio outro quem contou
             instrucoes.append(f"Você não tem nada novo para contar a {outro} sobre isso. "
                               f"Reaja ao que {outro} disse.")
@@ -585,7 +610,7 @@ class Agente:
                  + "\n".join(f"- {i}" for i in instrucoes))
         resposta = self._falar(self._mensagens(outro, final), llm)
         self._guardar_historico(outro, ouviu, resposta)
-        return {"de": self.nome, "tatica": tatica, "texto": resposta, "fatos": fatos_saida}
+        return {"de": self.nome, "alvo": outro, "tatica": tatica, "texto": resposta, "fatos": fatos_saida}
 
     # ------------------------------------------------------------------
     # 4.8) RESUMO para o terminal
@@ -601,3 +626,7 @@ class Agente:
                           f"medo {r['medo']:.2f} | desconfianca {r['desconfianca']:.2f} | "
                           f"deve favor {r['favor_devido']:.2f}")
         return "\n".join(linhas)
+
+
+# Alias para compatibilidade entre nomenclatura 'Agente' e 'Ator'
+Ator = Agente

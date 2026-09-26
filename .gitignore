@@ -47,6 +47,8 @@ pnpm-debug.log*
 
 # Bancos de dados locais
 agentes/
+atores/
+cenario/
 *.sqlite
 *.sqlite3
 *.db
