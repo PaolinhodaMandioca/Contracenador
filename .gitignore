@@ -46,6 +46,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Bancos de dados locais
+agentes/
 *.sqlite
 *.sqlite3
 *.db
