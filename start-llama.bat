@@ -1,0 +1,1 @@
+llama-server -hf Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_K_M -c 4096 -np 2 --port 8080
