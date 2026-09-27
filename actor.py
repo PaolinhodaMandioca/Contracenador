@@ -34,6 +34,14 @@ import colors
 # só é calculado quando o valor é lido (nada fica rodando em segundo plano).
 HALF_LIFE = {"guilt": 1800, "fear": 900, "frustration": 600}
 
+# Quantas vezes seguidas choose_action() pode repetir a MESMA postura sobre o mesmo fato com o
+# mesmo interlocutor antes de ser forçado a sortear de novo, mesmo sem nada ter mudado o
+# suficiente (ver "postura persistente" em choose_action). Sem este teto, um culpado com
+# personalidade decidida podia ficar preso em DEFLECT/HIDE pra sempre contra um investigador
+# manso (que nunca ameaça o bastante pra mexer o placar em 0.5) - bug real: 15 rodadas
+# pressionando o culpado certo, sem nunca sequer tentar de novo a sorte de revelar.
+STANCE_PERSISTENCE = 3
+
 # Traços de personalidade (0 a 1). Servem de "pesos" nas funções de decisão.
 DEFAULT_TRAITS = {
     "honesty": 0.5,          # tendência a falar a verdade
@@ -319,7 +327,7 @@ class Actor:
         # Coisas que vivem só na RAM (somem quando o programa fecha):
         self.history = {}         # conversa recente com cada interlocutor
         self.disclosed = set()    # (interlocutor, id_da_memoria) que já foram revelados de verdade
-        self.stances = {}         # (interlocutor, id_da_memoria) -> (decisão, placar) da última decisão
+        self.stances = {}         # (interlocutor, id_da_memoria) -> (decisão, placar, extra, tentativas)
         self.satisfied = set()    # interlocutores de quem já consegui a informação que queria
         self.waiting = False      # True se o último passo foi pedir algo e a resposta ainda não veio
         self.verbose = True       # imprime no terminal as decisões internas (bom para ajustar pesos)
@@ -712,12 +720,21 @@ class Actor:
         # POSTURA PERSISTENTE: se eu já decidi esconder/mentir/desviar sobre este fato nesta
         # conversa, mantenho a decisão enquanto nada mudar de verdade. Sem isso, sortear de novo
         # a cada fala faria qualquer um acabar contando (é só esperar o sorteio). Ameaça, culpa
-        # ou confiança que mexem no placar em 0.5 ou mais fazem o ator reconsiderar.
+        # ou confiança que mexem no placar em 0.5 ou mais fazem o ator reconsiderar - mas isso
+        # sozinho podia travar o jogo: contra um investigador manso (que nunca ameaça o
+        # suficiente para mexer o placar), o placar nunca sobe 0.5 de uma vez, então a postura
+        # nunca era reconsiderada, nem depois de 15 rodadas de pressão. STANCE_PERSISTENCE limita
+        # quantas vezes seguidas a mesma postura pode se repetir "de graça": depois disso, mesmo
+        # sem uma virada brusca, o personagem é forçado a sortear de novo - a pressão repetida
+        # (o placar subindo aos poucos) volta a valer alguma coisa em vez de ser só decoração no
+        # log.
         key = (other, fact["id"])
         previous = self.stances.get(key)
-        if previous and abs(wants_to_reveal - previous[1]) < 0.5:
-            decision, _, extra = previous
-            return decision, extra, reveal_chance
+        if previous:
+            prev_decision, prev_score, prev_extra, attempts = previous
+            if abs(wants_to_reveal - prev_score) < 0.5 and attempts < STANCE_PERSISTENCE:
+                self.stances[key] = (prev_decision, prev_score, prev_extra, attempts + 1)
+                return prev_decision, prev_extra, reveal_chance
 
         if random.random() < reveal_chance:
             decision, extra = "REVEAL", None
@@ -742,7 +759,7 @@ class Actor:
                     decision, extra = "LIE", None
                 else:
                     decision, extra = "HIDE", None
-        self.stances[key] = (decision, wants_to_reveal, extra)
+        self.stances[key] = (decision, wants_to_reveal, extra, 0)
         return decision, extra, reveal_chance
 
     def choose_tactic(self, other):
