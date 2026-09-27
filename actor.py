@@ -24,6 +24,8 @@ import sqlite3
 import time
 import unicodedata
 
+import colors
+
 # ============================================================================
 # 1) CONFIGURAÇÕES GERAIS
 # ============================================================================
@@ -312,7 +314,7 @@ class Actor:
 
     def _log(self, message):
         if self.verbose:
-            print(f"   . {message}")
+            print(colors.dim(f"   . {message}"))
 
     def save_personality(self):
         self.db.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('personality', ?)",
@@ -851,8 +853,15 @@ class Actor:
 
     def _speak(self, messages, llm):
         if self.verbose:
-            print(f"\n[{self.name}] ", end="", flush=True)
-        return llm.generate(messages, slot=self.slot, live=self.verbose) or "..."
+            # Nome em negrito + cor própria do personagem, depois a fala em si na mesma cor
+            # (sem negrito) - assim dá pra diferenciar de longe quem está falando, e a fala
+            # não se mistura visualmente com os logs cinza de decisão (ver _log).
+            tint = colors.color_for_name(self.name)
+            print(f"\n{colors.BOLD}{tint}[{self.name}]{colors.RESET} {tint}", end="", flush=True)
+        response = llm.generate(messages, slot=self.slot, live=self.verbose) or "..."
+        if self.verbose:
+            print(colors.RESET)  # fecha a cor e deixa uma linha em branco de respiro
+        return response
 
     # ------------------------------------------------------------------
     # 4.6) CONVERSA COM VOCÊ (o dono): sem mentiras, com acesso a todas as memórias

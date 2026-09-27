@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 
+import colors
 from actor import Actor, DEFAULT_TRAITS, clamp, create_actor, detect_subject, normalize
 from llm import LLM
 from screenwriter import generate_scene_llm, materialize_scene
@@ -426,7 +427,7 @@ def cmd_talk(actors, rest, turns, llm):
 
     a.new_conversation(b.name)
     b.new_conversation(a.name)
-    print(f'\n=== {a.name} e {b.name} conversam sobre "{topic}" ({turns} falas) ===')
+    print(colors.heading(f'\n=== {a.name} e {b.name} conversam sobre "{topic}" ({turns} falas) ==='))
 
     speaker, listener = a, b
     envelope = speaker.open_conversation(listener.name, topic, llm)      # fala 1
@@ -493,13 +494,13 @@ def cmd_scene(actors, rest, scenario_folder, llm):
     if rest.strip().isdigit():
         max_rounds = max(1, int(rest.strip()))
 
-    print(f"\n{'=' * 65}")
-    print(f"[CENA] A SALA DE INVESTIGAÇÃO")
+    print(colors.heading(f"\n{'=' * 65}"))
+    print(colors.heading("[CENA] A SALA DE INVESTIGAÇÃO"))
     print(f"Incidente: \"{scenario_data.get('scene')}\"")
     print(f"Investigador(a): {investigator.name} | Objetivo: {topic}")
     print(f"Presentes na sala: {', '.join(a.name for a in actors.values())}")
     print(f"Teto de rodadas: {max_rounds}")
-    print(f"{'=' * 65}")
+    print(colors.heading(f"{'=' * 65}"))
 
     # Inicializa o contexto de conversa entre o investigador e os outros
     for s in suspects:
@@ -518,7 +519,7 @@ def cmd_scene(actors, rest, scenario_folder, llm):
     victory = False
 
     for round_ in range(1, max_rounds + 1):
-        print(f"\n--- [Rodada {round_}/{max_rounds}] ---")
+        print(colors.heading(f"\n--- [Rodada {round_}/{max_rounds}] ---"))
 
         # Quem interrogar é SEMPRE decisão do investigador, nunca do usuário nem de um sorteio
         # solto: o código monta as opções e o contexto (suspeita já reunida), o LLM escolhe um
@@ -527,9 +528,9 @@ def cmd_scene(actors, rest, scenario_folder, llm):
         candidate_names = [s.name for s in suspects]
         target_name = investigator.choose_investigation_target(candidate_names, topic, llm)
         target = actors[target_name.lower()]
-        print(f"-> {investigator.name} decide focar em {target.name}.")
+        print(colors.dim(f"-> {investigator.name} decide focar em {target.name}."))
 
-        print(f"\n[Interrogatório] {investigator.name} aborda {target.name}...")
+        print(colors.dim(f"\n[Interrogatório] {investigator.name} aborda {target.name}..."))
 
         # 1) Investigador fala com o alvo
         question_envelope = investigator.open_conversation(target.name, topic, llm)
@@ -563,11 +564,12 @@ def cmd_scene(actors, rest, scenario_folder, llm):
 
             guilty_belief = investigator.belief(f"{guilty.name} é o culpado")
             if guilty_belief and guilty_belief["confidence"] >= 0.75 and not victory:
-                print(f"\n{'*' * 65}")
-                print(f"*** VITÓRIA DA INVESTIGAÇÃO POR DEDUÇÃO! (Rodada {round_}) ***")
-                print(f"{investigator.name} tem {guilty_belief['confidence']:.0%} de certeza de que "
-                      f"{guilty.name} é o culpado, com base nas evidências reunidas.")
-                print(f"{'*' * 65}")
+                print(colors.victory(f"\n{'*' * 65}"))
+                print(colors.victory(f"*** VITÓRIA DA INVESTIGAÇÃO POR DEDUÇÃO! (Rodada {round_}) ***"))
+                print(colors.victory(
+                    f"{investigator.name} tem {guilty_belief['confidence']:.0%} de certeza de que "
+                    f"{guilty.name} é o culpado, com base nas evidências reunidas."))
+                print(colors.victory(f"{'*' * 65}"))
                 victory = True
                 break
 
@@ -586,21 +588,21 @@ def cmd_scene(actors, rest, scenario_folder, llm):
         # 5) Fim Dinâmico: checa se a verdade entrou na memória do investigador
         investigator_memories = [m["text"].strip() for m in investigator.list_memories()]
         if any(exact_truth == m or exact_truth in m for m in investigator_memories):
-            print(f"\n{'*' * 65}")
-            print(f"*** VITÓRIA DA INVESTIGAÇÃO! (Descoberto na rodada {round_}) ***")
-            print(f"{investigator.name} conseguiu a confissão da verdade:")
-            print(f"\"{exact_truth}\"")
-            print(f"{'*' * 65}")
+            print(colors.victory(f"\n{'*' * 65}"))
+            print(colors.victory(f"*** VITÓRIA DA INVESTIGAÇÃO! (Descoberto na rodada {round_}) ***"))
+            print(colors.victory(f"{investigator.name} conseguiu a confissão da verdade:"))
+            print(colors.victory(f"\"{exact_truth}\""))
+            print(colors.victory(f"{'*' * 65}"))
             victory = True
             break
 
     if not victory and round_ == max_rounds:
-        print(f"\n{'*' * 65}")
-        print(f"*** VITÓRIA DO CULPADO POR EXAUSTÃO! ***")
-        print(f"{guilty.name} conseguiu despistar {investigator.name} após {max_rounds} rodadas.")
-        print(f"A verdade que ficou oculta foi:")
-        print(f"\"{exact_truth}\"")
-        print(f"{'*' * 65}")
+        print(colors.defeat(f"\n{'*' * 65}"))
+        print(colors.defeat(f"*** VITÓRIA DO CULPADO POR EXAUSTÃO! ***"))
+        print(colors.defeat(f"{guilty.name} conseguiu despistar {investigator.name} após {max_rounds} rodadas."))
+        print(colors.defeat(f"A verdade que ficou oculta foi:"))
+        print(colors.defeat(f"\"{exact_truth}\""))
+        print(colors.defeat(f"{'*' * 65}"))
 
     # Fecha os objetivos (roadmap, seção 17): dá desfecho explícito, não deixa "ativo" pra sempre.
     investigator.update_goal(topic, status="done" if victory else "failed")
