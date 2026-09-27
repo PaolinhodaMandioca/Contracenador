@@ -189,6 +189,14 @@ Isso exige o servidor iniciado com `--embeddings` (o `main.py` já liga isso soz
 dos Atores). Se o servidor não suportar - build antiga, ou rodando sem a flag -, o Ator detecta
 o erro na primeira tentativa e volta a usar `recordar()` pelo resto da sessão, sem travar nada.
 
+**Honestidade sobre a qualidade**: testado ao vivo contra um llama-server real, o embedding de um
+modelo de chat comum (não treinado com objetivo de embedding) é um sinal **ruidoso** - às vezes
+rankeia uma memória aleatória acima da que realmente importa. Por isso `_recordar_melhor()` (usada
+internamente por `responder()`/`falar_com_usuario`) **combina** as duas buscas em vez de a
+semântica substituir a lexical: o que a busca por palavra já encontra sempre vem primeiro,
+garantido; a busca semântica só ACRESCENTA candidatos que a lexical não acharia (paráfrases sem
+nenhuma palavra em comum), mesmo que o ranking dela sozinha não seja confiável.
+
 ## Limitações conhecidas
 
 - Memória semântica (embeddings) só funciona se o llama-server tiver sido iniciado com

@@ -89,6 +89,49 @@ class TestRecordarSemantico(TesteComAtores):
         self.assertEqual(resultado, [])
 
 
+class TestRecordarMelhorCombina(TesteComAtores):
+    """_recordar_melhor combina lexical + semântica em vez de a semântica substituir a
+    lexical - o embedding de um LLM genérico é um sinal ruidoso (testado ao vivo contra um
+    llama-server real: às vezes rankeia uma memória aleatória acima da relevante), então a
+    lexical roda sempre primeiro e a semântica só ACRESCENTA o que a lexical não achou."""
+
+    def test_combina_sem_descartar_o_achado_lexical(self):
+        joao = self.criar_ator("Joao")
+        joao.lembrar("Vi Carlos saindo do escritorio.", compartilhavel=1)  # bate por palavra
+        joao.lembrar("Falava-se muito sobre o assunto na festa.", compartilhavel=1)  # só semântico
+
+        vetores = {
+            "escritorio": [1.0, 0.0],
+            "Vi Carlos saindo do escritorio.": [0.0, 1.0],       # longe no espaço semântico
+            "Falava-se muito sobre o assunto na festa.": [0.9, 0.1],  # perto da consulta
+        }
+        llm = FakeLLMComEmbeddings(vetores)
+
+        resultado = joao._recordar_melhor("escritorio", llm, k=5)
+        textos = [m["texto"] for m in resultado]
+        # O achado lexical vem primeiro mesmo o embedding dele sendo "distante" - a lexical
+        # nunca é sobrescrita pelo ranking semântico.
+        self.assertEqual(textos[0], "Vi Carlos saindo do escritorio.")
+        self.assertIn("Falava-se muito sobre o assunto na festa.", textos)
+
+    def test_respeita_o_limite_k_apos_combinar(self):
+        joao = self.criar_ator("Joao")
+        joao.lembrar("Fato lexical.", compartilhavel=1)
+        joao.lembrar("Algo relevante A ocorreu.", compartilhavel=1)
+        joao.lembrar("Algo relevante B ocorreu.", compartilhavel=1)
+
+        vetores = {
+            "fato": [1.0, 0.0, 0.0],
+            "Fato lexical.": [0.0, 1.0, 0.0],
+            "Algo relevante A ocorreu.": [0.9, 0.0, 0.1],
+            "Algo relevante B ocorreu.": [0.8, 0.0, 0.2],
+        }
+        llm = FakeLLMComEmbeddings(vetores)
+
+        resultado = joao._recordar_melhor("fato", llm, k=2)
+        self.assertEqual(len(resultado), 2)
+
+
 class TestRecordarMelhorComFallback(TesteComAtores):
     """_recordar_melhor nunca pode quebrar uma conversa por causa de um servidor sem
     --embeddings - precisa cair para a busca lexical de sempre."""

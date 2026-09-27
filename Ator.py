@@ -401,18 +401,35 @@ class Agente:
 
     def _recordar_melhor(self, consulta, llm, k=3, so_compartilhaveis=False):
         """
-        Tenta memória semântica; se o servidor não suportar embeddings (não foi iniciado com
-        --embeddings) ou der qualquer erro de rede, cai para a busca lexical de sempre - nunca
-        quebra uma conversa por causa disso. Uma vez que o servidor responde embeddings, fica
-        assim para o resto da sessão (não fica tentando de novo a cada turno).
+        COMBINA busca lexical com semântica, em vez de a semântica substituir a lexical.
+
+        Por quê: testado ao vivo contra o llama-server real, o embedding de um modelo genérico
+        de chat (não treinado com objetivo de embedding) é um sinal RUIDOSO - em alguns casos
+        rankeia uma memória completamente aleatória acima da que realmente importa. Não dá pra
+        confiar nele sozinho para decidir a ORDEM. Mas ele ainda é útil para achar candidatos
+        que a busca por palavra jamais acharia (paráfrases sem nenhuma palavra em comum).
+
+        Por isso: a lexical roda sempre primeiro (garante que combinação óbvia de palavra nunca
+        se perde por causa de um ranking semântico ruim); a semântica só ACRESCENTA candidatos
+        que a lexical não achou, sem reordenar os que ela já achou.
+
+        Se o servidor não suportar embeddings (não iniciado com --embeddings) ou der erro de
+        rede, usa só a lexical - nunca quebra uma conversa por causa disso. Uma vez que o
+        servidor falha, fica assim pelo resto da sessão (não fica tentando de novo a cada turno).
         """
+        lexicas = self.recordar(consulta, k=k, so_compartilhaveis=so_compartilhaveis)
         if getattr(self, "_sem_embedding", False):
-            return self.recordar(consulta, k=k, so_compartilhaveis=so_compartilhaveis)
+            return lexicas
+
         try:
-            return self.recordar_semantico(consulta, llm, k=k, so_compartilhaveis=so_compartilhaveis)
+            semanticas = self.recordar_semantico(consulta, llm, k=k, so_compartilhaveis=so_compartilhaveis)
         except RuntimeError:
             self._sem_embedding = True
-            return self.recordar(consulta, k=k, so_compartilhaveis=so_compartilhaveis)
+            return lexicas
+
+        vistas = {m["id"] for m in lexicas}
+        combinadas = lexicas + [m for m in semanticas if m["id"] not in vistas]
+        return combinadas[:k]
 
     def listar_memorias(self):
         return [dict(m) for m in self.db.execute("SELECT * FROM memorias ORDER BY id")]

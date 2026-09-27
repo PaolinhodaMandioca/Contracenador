@@ -100,8 +100,12 @@ class LLM:
         if isinstance(dados, list):  # algumas versões devolvem uma lista de resultados
             dados = dados[0]
         vetor = dados["embedding"]
-        if vetor and isinstance(vetor[0], list):  # ou uma lista de vetores (um por pooling)
-            vetor = vetor[0]
+        if vetor and isinstance(vetor[0], list):
+            # Servidor com pooling 'none': um vetor POR TOKEN, não um só pro texto inteiro.
+            # Faz a média entre os tokens (mean pooling) em vez de pegar só o primeiro token,
+            # que não representaria o texto sozinho.
+            dimensao = len(vetor[0])
+            vetor = [sum(tok[i] for tok in vetor) / len(vetor) for i in range(dimensao)]
         return vetor
 
     def _pedir(self, caminho, corpo):
