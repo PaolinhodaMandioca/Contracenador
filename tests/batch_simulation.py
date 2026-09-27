@@ -16,6 +16,7 @@ Uso:
 import argparse
 import os
 import random
+import re
 import shutil
 import sys
 import tempfile
@@ -28,10 +29,17 @@ from world import (evidence_by_origin, open_world, position, register_evidence,
 
 
 class DeafMuteLLM:
-    """LLM falso: a estatística só depende das decisões em código, o texto não importa."""
+    """LLM falso "cooperativo": ecoa de volta os trechos entre aspas da instrução (onde
+    respond() coloca "conte a fulano: '...'"), em vez de um texto fixo genérico. Necessário
+    porque respond() agora valida se a fala realmente verbalizou o que o código decidiu
+    revelar/mentir (ver actor.verbalized) - um fake sempre-mudo faria REVEAL/LIE serem
+    descartados em toda rodada, o que inflaria artificialmente a taxa de "culpado escapou"
+    e não mediria mais o que choose_action()/choose_tactic() de fato decidem."""
 
-    def generate(self, *args, **kwargs):
-        return "..."
+    def generate(self, messages, *args, **kwargs):
+        content = messages[-1]["content"] if messages else ""
+        quotes = re.findall(r'"([^"]+)"', content)
+        return " ".join(quotes) if quotes else "..."
 
     def embedding(self, text):
         # Sem --embeddings: os Atores caem sozinhos pra busca lexical (ver Actor._recall_best).

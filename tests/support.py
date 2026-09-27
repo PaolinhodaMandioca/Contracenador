@@ -3,6 +3,7 @@ support.py - utilidades compartilhadas pelos testes (não é um módulo de teste
 nada sozinho). Mantém os arquivos .db de cada teste isolados num diretório temporário.
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -14,17 +15,29 @@ from actor import Actor, DEFAULT_TRAITS, create_actor
 
 
 class FakeLLM:
-    """LLM falso: não faz rede nem inferência, só devolve um texto fixo. As estatísticas e
-    comportamentos testados aqui dependem das decisões em CÓDIGO (Actor.choose_action e afins),
-    não do texto gerado - por isso um LLM de verdade nunca é necessário nestes testes."""
+    """LLM falso: não faz rede nem inferência. As estatísticas e comportamentos testados aqui
+    dependem das decisões em CÓDIGO (Actor.choose_action e afins), não do texto gerado - por
+    isso um LLM de verdade nunca é necessário nestes testes.
 
-    def __init__(self, response="..."):
+    "Cooperativo" por padrão: ecoa de volta os trechos entre aspas da instrução recebida (é
+    onde respond() coloca "conte a fulano: '...'"), em vez de sempre devolver um texto fixo que
+    não menciona nada do que foi pedido. Isso é necessário porque respond() agora VALIDA se a
+    fala realmente verbalizou o que o código decidiu revelar/mentir (ver actor.verbalized) -
+    um fake sempre-mudo faria esse descarte acontecer em todo teste, mesmo quando não é isso
+    que o teste quer exercitar. Passe uma `response` explícita para voltar ao comportamento
+    fixo antigo (ex.: para testar justamente o caso de um LLM que ignora a instrução)."""
+
+    def __init__(self, response=None):
         self.response = response
         self.url = "fake"
 
     def generate(self, messages, max_tokens=150, temperature=0.7, slot=None, live=False,
                  response_format=None):
-        return self.response
+        if self.response is not None:
+            return self.response
+        content = messages[-1]["content"] if messages else ""
+        quotes = re.findall(r'"([^"]+)"', content)
+        return " ".join(quotes) if quotes else "..."
 
     def embedding(self, text):
         # Simula um llama-server iniciado SEM --embeddings: é exatamente o caso que

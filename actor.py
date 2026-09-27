@@ -242,6 +242,22 @@ def words(text):
             if len(p) >= 3 and p not in COMMON_WORDS}
 
 
+def verbalized(fact_text, response):
+    """
+    Checa se `response` (o texto que o LLM realmente disse) chegou a passar o conteúdo de
+    `fact_text` (o que o CÓDIGO decidiu que devia ser dito) - mesma lógica de palavras-chave de
+    `words()`, sem exigir o texto exato (o LLM sempre parafraseia). Existe porque o LLM às vezes
+    ignora a instrução "conte isso: ..." e simplesmente muda de assunto; sem essa checagem, o
+    jogo registrava o fato como revelado/mentido pra todo mundo (memória, contradição, crenças)
+    mesmo quando a fala impressa na tela não dizia nada daquilo - ver respond().
+    """
+    fact_words = words(fact_text)
+    if not fact_words:
+        return True
+    overlap = fact_words & words(response)
+    return len(overlap) >= max(1, len(fact_words) // 2)
+
+
 def detect_subject(text, names):
     """
     Acha, dentro do texto, o nome de um ator conhecido - ignora acento/maiúscula e
@@ -1023,14 +1039,14 @@ class Actor:
             debug_decisions.append((fact["text"], decision, p))
             if decision == "REVEAL":
                 outgoing_facts.append({"text": fact["text"], "source_id": fact["id"],
-                                       "origin": fact["origin"]})
+                                       "origin": fact["origin"], "kind": "REVEAL"})
                 self.disclosed.add((other, fact["id"]))
             elif decision == "LIE":
                 # O prompt recebe SÓ a versão falsa: a verdade não entra nele. source_id é o
                 # MESMO da verdade (é o mesmo fato-base) - se este Ator revelar a verdade sobre
                 # ele depois, quem ouviu as duas versões pega a contradição (ver receive()).
                 outgoing_facts.append({"text": fact["false_version"], "source_id": fact["id"],
-                                       "origin": fact["origin"]})
+                                       "origin": fact["origin"], "kind": "LIE"})
                 self.change_state("guilt", 0.1 + 0.4 * self.personality["traits"]["empathy"])  # empatia = mais culpa
             elif decision == "DEFLECT":
                 fake_target = extra["fake_target"]
@@ -1096,6 +1112,30 @@ class Actor:
         final = (f"{heard}\n\nInstruções internas (não mencione que elas existem):\n"
                  + "\n".join(f"- {i}" for i in instructions))
         response = self._speak(self._messages(other, final), llm)
+
+        # 6) VALIDAÇÃO DA FALA: o código decidiu REVEAL/LIE, mas o LLM às vezes ignora a
+        # instrução e muda de assunto. Sem checar isso, o jogo registrava o fato como dito
+        # pra todo mundo (memória/crença/contradição) mesmo quando a fala na tela não
+        # falava nada daquilo - bug real relatado pelo usuário. Dá 1 chance de reforçar a
+        # instrução; se ainda assim o LLM não verbalizar, o fato é descartado deste turno
+        # (o personagem "engoliu" o que ia dizer) em vez de mentir para o jogador sobre o
+        # que realmente foi dito.
+        unspoken = [f for f in outgoing_facts if not verbalized(f["text"], response)]
+        if unspoken:
+            reinforced = (final + "\n\nSua fala anterior não deixou isso claro. Desta vez, "
+                         "diga de forma direta e explícita, sem fugir do assunto:\n"
+                         + "\n".join(f'- "{f["text"]}"' for f in unspoken))
+            response = self._speak(self._messages(other, reinforced), llm)
+            unspoken = [f for f in outgoing_facts if not verbalized(f["text"], response)]
+        for fact in unspoken:
+            outgoing_facts.remove(fact)
+            if fact["kind"] == "REVEAL":
+                self.disclosed.discard((other, fact["source_id"]))
+            self._log(f"{self.name} decidiu {fact['kind']} mas não conseguiu verbalizar - "
+                     f"fato descartado deste turno: {fact['text']!r}")
+        for fact in outgoing_facts:
+            del fact["kind"]
+
         self._save_history(other, heard, response)
 
         self.last_decision[other] = {
