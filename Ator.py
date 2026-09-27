@@ -801,10 +801,16 @@ class Agente:
 
         # 2) Memórias relevantes E compartilháveis para a troca sobre TERCEIROS (o
         #    isolamento é garantido aqui). Ficam de fora: o que já contei a este agente, o
-        #    que ELE mesmo me contou, e o que é sobre ele mesmo (isso já foi tratado acima,
-        #    como reconhecimento, não como fofoca).
+        #    que ELE mesmo me contou, o que é sobre ele mesmo (isso já foi tratado acima, como
+        #    reconhecimento, não como fofoca) e o que é sobre MIM MESMO - se alguém me contou
+        #    (fofoca) que "Fulano é o culpado" e Fulano sou eu, isso NÃO é uma fofoca de
+        #    terceiro que eu preciso decidir revelar/esconder/mentir: é sobre a MINHA própria
+        #    verdade, que já é tratada separadamente (minha memória com origem='sistema'/minha
+        #    própria versão falsa). Sem essa exclusão, o mesmo fato "sobre mim" podia ser
+        #    decidido duas vezes no mesmo turno - uma vez pela minha verdade, outra pela
+        #    fofoca ecoada - e sair uma fala confessando e mentindo ao mesmo tempo.
         relevantes = self.recordar(f"{env['texto']} {topico}", k=4, so_compartilhaveis=True)
-        sobre_terceiros = [m for m in relevantes if m["sobre"] != outro]
+        sobre_terceiros = [m for m in relevantes if m["sobre"] not in (outro, self.nome)]
         pendentes = [m for m in sobre_terceiros
                      if (outro, m["id"]) not in self.contados and m["origem"] != outro][:2]
 
