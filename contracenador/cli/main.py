@@ -17,6 +17,7 @@ Uso:
                    --modelo-roteirista Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M
 """
 import argparse
+import json
 import os
 import random
 import shutil
@@ -34,6 +35,7 @@ from ..simulation import (
     SimulationEngine,
     run_private_pair_round,
 )
+from ..simulation.config import RuntimeConfig
 from ..world import (
     evidence_by_origin,
     find_event_by_type,
@@ -141,7 +143,14 @@ Comandos (qualquer outro texto é uma mensagem para o ator atual):
 # 1) ATORES E CENÁRIO: carregar do disco
 # ============================================================================
 
-def load_actors(folder, slots):
+def configure_actors(actors, config):
+    for actor in actors.values():
+        actor.llm_temperature = config.actor_temperature
+        actor.llm_max_tokens = config.actor_max_tokens
+    return actors
+
+
+def load_actors(folder, slots, config=None):
     """Cada arquivo .db da pasta é um Ator. Cada um recebe um slot fixo do servidor
     (os slots se repetem se houver mais atores que slots)."""
     actors = {}
@@ -150,10 +159,12 @@ def load_actors(folder, slots):
     for i, file_ in enumerate(sorted(f for f in os.listdir(folder) if f.endswith(".db"))):
         actor = Actor(os.path.join(folder, file_), slot=i % slots)
         actors[actor.name.lower()] = actor
-    return actors
+    return configure_actors(actors, config) if config is not None else actors
 
 
-def _start_fresh_game(actors_server, screenwriter_server, actors_folder, scenario_folder, slots):
+def _start_fresh_game(actors_server, screenwriter_server, actors_folder, scenario_folder, slots,
+                      screenwriter_max_tokens=1800, screenwriter_temperature=0.7,
+                      initial_theme=None):
     clear_scene_storage(actors_folder, scenario_folder)
 
     print("\n[Novo save] Pastas de atores e cenário limpas.")
@@ -163,14 +174,18 @@ def _start_fresh_game(actors_server, screenwriter_server, actors_folder, scenari
     print("[roteiro] Carregando primeiro o modelo do Roteirista (14B)...")
     screenwriter_server.start()
     try:
-        theme = ""
+        theme = (initial_theme or "").strip()
         while not theme:
             theme = input("Digite o tema ou incidente da nova cena:\n> ").strip()
             if not theme:
                 print("Por favor, digite um tema para a IA criar o mistério.")
 
         screenwriter_llm = LLM(screenwriter_server.url())
-        data = generate_scene_llm(screenwriter_llm, theme)
+        data = generate_scene_llm(
+            screenwriter_llm, theme,
+            max_tokens=screenwriter_max_tokens,
+            temperature=screenwriter_temperature,
+        )
         materialize_scene(data, actors_folder=actors_folder,
                           scenario_folder=scenario_folder, slots=slots)
     finally:
@@ -216,7 +231,8 @@ def cmd_scenario(scenario_folder):
     print(f"(Configurações completas salvas em '{scenario_folder}/cena.json')")
 
 
-def cmd_screenplay(actors_server, screenwriter_server, rest, actors_folder, scenario_folder, slots, current_actors):
+def cmd_screenplay(actors_server, screenwriter_server, rest, actors_folder, scenario_folder,
+                  slots, current_actors, config=None):
     """
     Gera uma nova cena com o Roteirista (14B, 100% via LLM) e recarrega os atores (7B).
     Fluxo com RAM apertada:
@@ -245,14 +261,18 @@ def cmd_screenplay(actors_server, screenwriter_server, rest, actors_folder, scen
         screenwriter_server.start()
 
         screenwriter_llm = LLM(screenwriter_server.url())
-        data = generate_scene_llm(screenwriter_llm, theme)
+        data = generate_scene_llm(
+            screenwriter_llm, theme,
+            max_tokens=config.screenwriter_max_tokens if config else 1800,
+            temperature=config.screenwriter_temperature if config else 0.7,
+        )
         materialize_scene(data, actors_folder=actors_folder, scenario_folder=scenario_folder, slots=slots)
 
         print("\n[roteiro] Voltando ao modelo dos atores (7B)...")
         screenwriter_server.stop()
         actors_server.start()
 
-        new_actors = load_actors(actors_folder, slots)
+        new_actors = load_actors(actors_folder, slots, config=config)
         print(f"\nCena pronta! Atores carregados: {', '.join(a.name for a in new_actors.values())}")
         return new_actors
     except Exception as e:
@@ -263,7 +283,7 @@ def cmd_screenplay(actors_server, screenwriter_server, rest, actors_folder, scen
                 actors_server.start()
             except Exception as e2:
                 print(f"[Erro ao reativar servidor de atores] {e2}")
-        return load_actors(actors_folder, slots)
+        return load_actors(actors_folder, slots, config=config)
 
 
 def cmd_remember(actor, text, llm, actors):
@@ -427,7 +447,8 @@ def _suspect_candidates(suspects, interrogated):
     return candidates
 
 
-def _record_revelation_evidence(world, envelope, character_names, recorded_revelations):
+def _record_revelation_evidence(world, envelope, character_names, recorded_revelations,
+                               direct_reliability=0.7, relayed_reliability=0.35):
     """Registra fatos declarados em eventos privados e evidências com sua proveniência."""
     evidence_ids = []
     speaker = envelope["from"]
@@ -449,7 +470,10 @@ def _record_revelation_evidence(world, envelope, character_names, recorded_revel
             item for item in evidence_by_origin(world, speaker)
             if item["content"] == text and item["subject"] == subject
         ), None)
-        default_reliability = 0.7 if fact.get("origin") in {"system", "observation", "user"} else 0.35
+        default_reliability = (
+            direct_reliability if fact.get("origin") in {"system", "observation", "user"}
+            else relayed_reliability
+        )
         reliability = fact.get(
             "reliability", existing["reliability"] if existing else default_reliability,
         )
@@ -465,7 +489,7 @@ def _record_revelation_evidence(world, envelope, character_names, recorded_revel
     return evidence_ids
 
 
-def _update_beliefs_from_evidence(investigator, world, origin, processed_evidence):
+def _update_beliefs_from_evidence(investigator, world, origin, processed_evidence, delta=0.2):
     """Aplica cada testemunho uma vez, ponderando o reforço pela confiabilidade."""
     for evidence in evidence_by_origin(world, origin):
         key = (evidence["origin"], evidence["subject"], evidence["content"])
@@ -476,12 +500,12 @@ def _update_beliefs_from_evidence(investigator, world, origin, processed_evidenc
         processed_evidence.add(key)
         reliability = clamp(float(evidence.get("reliability", 0.7)))
         investigator.update_belief(
-            f"{evidence['subject']} é o culpado", delta=0.2 * reliability,
+            f"{evidence['subject']} é o culpado", delta=delta * reliability,
             origin=origin, subject=evidence["subject"], evidence=f"evidence:{evidence['id']}",
         )
 
 
-def cmd_scene(actors, rest, scenario_folder, llm):
+def cmd_scene(actors, rest, scenario_folder, llm, config=None):
     """
     Orquestra a dinâmica da 'Sala' (Contracenador com 5 atores), do início ao fim, sem pausa
     interativa a cada rodada - o usuário só acompanha:
@@ -534,16 +558,24 @@ def cmd_scene(actors, rest, scenario_folder, llm):
 
     topic = investigator_info.get("goal") or scenario_data.get("scene", "O mistério")
 
-    max_rounds = 10
+    max_rounds = config.investigation_rounds if config else 10
     if rest.strip().isdigit():
         max_rounds = max(1, int(rest.strip()))
+    dialogue_rounds = config.dialogue_rounds if config else DIALOGUE_ROUNDS
+    influence_enabled = config.influence_enabled if config else True
+    influence_weight = config.influence_weight if config else 0.25
+    simultaneous_conversations = config.simultaneous_conversations if config else 2
+    deduction_threshold = config.deduction_threshold if config else 0.75
+    evidence_delta = config.evidence_delta if config else 0.2
+    direct_reliability = config.direct_reliability if config else 0.7
+    relayed_reliability = config.relayed_reliability if config else 0.35
 
     print(colors.heading(f"\n{'=' * 65}"))
     print(colors.heading("[CENA] A SALA DE INVESTIGAÇÃO"))
     print(f"Incidente: \"{scenario_data.get('scene')}\"")
     print(f"Investigador(a): {investigator.name} | Objetivo: {topic}")
     print(f"Elenco: {', '.join(a.name for a in actors.values())}")
-    print(f"Teto de interrogatórios: {max_rounds} | Diálogo por suspeito: {DIALOGUE_ROUNDS} trocas")
+    print(f"Teto de interrogatórios: {max_rounds} | Diálogo por linha: {dialogue_rounds} trocas")
     print(colors.heading(f"{'=' * 65}"))
 
     # Inicializa o contexto de conversa entre o investigador e os outros
@@ -571,7 +603,7 @@ def cmd_scene(actors, rest, scenario_folder, llm):
 
     def select_investigation_pair(available_agents, investigation_round, history):
         print(colors.heading(f"\n--- [Rodada de investigação {investigation_round}/{max_rounds}] ---"))
-        print(colors.dim(f"Bloco ativo: {DIALOGUE_ROUNDS} trocas privadas com um suspeito antes de seguir."))
+        print(colors.dim(f"Bloco ativo: {dialogue_rounds} trocas privadas antes de seguir."))
 
         candidate_names = _suspect_candidates(suspects, interrogated)
         if not candidate_names:
@@ -579,16 +611,21 @@ def cmd_scene(actors, rest, scenario_folder, llm):
             interrogated.clear()
             candidate_names = _suspect_candidates(suspects, interrogated)
 
-        target_name = investigator.choose_investigation_target(candidate_names, topic, llm)
+        target_name = investigator.choose_investigation_target(
+            candidate_names, topic, llm,
+            temperature=config.investigator_temperature if config else 0.3,
+            max_tokens=config.investigator_max_tokens if config else 20,
+            fatigue_weight=config.interrogation_fatigue if config else 0.12,
+        )
         target = actors[target_name.lower()]
         interrogated.add(target.name)
         print(colors.dim(f"-> {investigator.name} decide focar em {target.name}."))
-        print(colors.dim(f"\n[Interrogatório privado] {investigator.name} conversa com {target.name} por {DIALOGUE_ROUNDS} rounds."))
+        print(colors.dim(f"\n[Interrogatório privado] {investigator.name} conversa com {target.name} por {dialogue_rounds} rounds."))
         lanes = [ConversationLane(investigator, target, topic)]
 
         available_influence_targets = (
             [witness for witness in witnesses if witness is not target]
-            if target is not guilty else []
+            if influence_enabled and simultaneous_conversations > 1 and target is not guilty else []
         )
         if available_influence_targets:
             influence_target = min(
@@ -606,6 +643,7 @@ def cmd_scene(actors, rest, scenario_folder, llm):
                 def open_influence(initiator, respondent, lane_topic, lane_llm):
                     return initiator.open_influence_conversation(
                         respondent.name, lane_topic, false_subject.name, lane_llm,
+                        weight=influence_weight,
                     )
 
                 lanes.append(ConversationLane(
@@ -622,7 +660,7 @@ def cmd_scene(actors, rest, scenario_folder, llm):
         nonlocal victory
         print(colors.dim(
             f"  [{initiator.name} -> {respondent.name}] diálogo "
-            f"{dialogue_round}/{DIALOGUE_ROUNDS}"
+            f"{dialogue_round}/{dialogue_rounds}"
         ))
 
         for env in (question_envelope, answer_envelope):
@@ -642,18 +680,20 @@ def cmd_scene(actors, rest, scenario_folder, llm):
             if env.get("facts"):
                 _record_revelation_evidence(
                     world, env, [actor.name for actor in actors.values()], recorded_revelations,
+                    direct_reliability=direct_reliability,
+                    relayed_reliability=relayed_reliability,
                 )
 
         if initiator is investigator and (answer_envelope.get("facts") or answer_envelope.get("accusations")):
             _update_beliefs_from_evidence(
-                investigator, world, respondent.name, processed_evidence,
+                investigator, world, respondent.name, processed_evidence, delta=evidence_delta,
             )
 
         if victory:
             return True
 
         guilty_belief = investigator.belief(f"{guilty.name} é o culpado")
-        if guilty_belief and guilty_belief["confidence"] >= 0.75:
+        if guilty_belief and guilty_belief["confidence"] >= deduction_threshold:
             print(colors.victory(f"\n{'*' * 65}"))
             print(colors.victory(f"*** VITÓRIA DA INVESTIGAÇÃO POR DEDUÇÃO! (Rodada {investigation_round}) ***"))
             print(colors.victory(
@@ -681,13 +721,16 @@ def cmd_scene(actors, rest, scenario_folder, llm):
         return False
 
     engine = SimulationEngine(actors.values(), select_investigation_pair)
-    turn_history = engine.run(
-        topic,
-        llm,
-        max_turns=max_rounds,
-        rounds_per_pair=DIALOGUE_ROUNDS,
-        on_exchange=process_exchange,
-    )
+    try:
+        turn_history = engine.run(
+            topic,
+            llm,
+            max_turns=max_rounds,
+            rounds_per_pair=dialogue_rounds,
+            on_exchange=process_exchange,
+        )
+    finally:
+        world.close()
 
     if not victory and len(turn_history) == max_rounds:
         print(colors.defeat(f"\n{'*' * 65}"))
@@ -701,7 +744,6 @@ def cmd_scene(actors, rest, scenario_folder, llm):
     investigator.update_goal(topic, status="done" if victory else "failed")
     guilty.update_goal("Não ser descoberto", status="failed" if victory else "done")
 
-    world.close()
     print("\n=== Resumo final dos personagens ===")
     print(investigator.summary())
     print()
@@ -712,15 +754,15 @@ def cmd_scene(actors, rest, scenario_folder, llm):
 # 3) PROGRAMA PRINCIPAL
 # ============================================================================
 
-def main():
+def build_argument_parser():
     parser = argparse.ArgumentParser(
         description="Atores de IA isolados com Roteirista (dois modelos, gerenciados automaticamente)",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    # Modelos
+    parser.add_argument("--config-json", help="Arquivo JSON com parâmetros de experimento")
     parser.add_argument(
         "--modelo-atores",
-        default=ServerManager.ACTORS_MODEL,
+        dest="model_actors",
         metavar="MODELO",
         help=(
             "Modelo para os atores (7B).\n"
@@ -731,64 +773,160 @@ def main():
     )
     parser.add_argument(
         "--modelo-roteirista",
-        default=ServerManager.SCREENWRITER_MODEL,
+        dest="model_screenwriter",
         metavar="MODELO",
         help=(
             "Modelo para o Roteirista (14B).\n"
             f"  Padrão: {ServerManager.SCREENWRITER_MODEL}"
         ),
     )
-    # Portas
-    parser.add_argument("--porta-atores",      type=int, default=8080, help="Porta do servidor 7B (padrão: 8080)")
-    parser.add_argument("--porta-roteirista",  type=int, default=8081, help="Porta do servidor 14B (padrão: 8081)")
-    # Outros
-    parser.add_argument("--slots",   type=int, default=2,  help="Número de slots KV do llama-server (padrão: 2)")
-    parser.add_argument("--threads", type=int, default=None, help="Número de threads de CPU do llama-server (padrão: automático)")
-    parser.add_argument("--camadas-gpu-atores", type=int, default=None,
+    parser.add_argument("--porta-atores", dest="port_actors", type=int, help="Porta do servidor 7B")
+    parser.add_argument("--porta-roteirista", dest="port_screenwriter", type=int,
+                        help="Porta do servidor 14B")
+    parser.add_argument("--slots", dest="slots_actors", type=int,
+                        help="Slots KV do servidor dos atores")
+    parser.add_argument("--slots-roteirista", dest="slots_screenwriter", type=int,
+                        help="Slots KV do servidor do roteirista")
+    parser.add_argument("--threads", type=int, help="Threads de CPU de ambos os servidores")
+    parser.add_argument("--contexto-atores", dest="context_actors", type=int,
+                        help="Tamanho do contexto do modelo dos atores")
+    parser.add_argument("--contexto-roteirista", dest="context_screenwriter", type=int,
+                        help="Tamanho do contexto do modelo do roteirista")
+    parser.add_argument("--camadas-gpu-atores", dest="gpu_layers_actors", type=int,
                         help="Limite manual de camadas dos atores na GPU (padrão: ajuste automático à VRAM)")
-    parser.add_argument("--camadas-gpu-roteirista", type=int, default=None,
+    parser.add_argument("--camadas-gpu-roteirista", dest="gpu_layers_screenwriter", type=int,
                         help="Limite manual de camadas do roteirista na GPU (padrão: ajuste automático à VRAM)")
-    parser.add_argument("--pasta",   default="atores",  help="Pasta dos arquivos .db dos atores")
-    parser.add_argument("--cenario", default="cenario", help="Pasta onde o arquivo cena.json é salvo")
-    parser.add_argument("--semente", type=int,          help="Fixa o sorteio das decisões (para testes)")
-    parser.add_argument("--verificar-ambiente", action="store_true",
-                        help="Verifica requisitos locais sem iniciar modelos nem alterar saves")
-    args = parser.parse_args()
+    embeddings_group = parser.add_mutually_exclusive_group()
+    embeddings_group.add_argument("--embeddings", dest="embeddings", action="store_true",
+                                  help="Ativa embeddings no servidor dos atores")
+    embeddings_group.add_argument("--sem-embeddings", dest="embeddings", action="store_false",
+                                  help="Desativa embeddings no servidor dos atores")
 
-    if args.semente is not None:
-        random.seed(args.semente)
+    parser.add_argument("--temperatura-atores", dest="actor_temperature", type=float,
+                        help="Temperatura das falas dos atores (0 a 2)")
+    parser.add_argument("--tokens-atores", dest="actor_max_tokens", type=int,
+                        help="Limite de tokens por fala do ator")
+    parser.add_argument("--temperatura-investigador", dest="investigator_temperature", type=float,
+                        help="Temperatura ao selecionar o suspeito (0 a 2)")
+    parser.add_argument("--tokens-investigador", dest="investigator_max_tokens", type=int,
+                        help="Limite de tokens ao selecionar o suspeito")
+    parser.add_argument("--temperatura-roteirista", dest="screenwriter_temperature", type=float,
+                        help="Temperatura de geração da cena (0 a 2)")
+    parser.add_argument("--tokens-roteirista", dest="screenwriter_max_tokens", type=int,
+                        help="Limite de tokens da geração da cena")
+
+    parser.add_argument("--rodadas-investigacao", dest="investigation_rounds", type=int,
+                        help="Número máximo de interrogatórios")
+    parser.add_argument("--rodadas-dialogo", dest="dialogue_rounds", type=int,
+                        help="Trocas de fala em cada conversa privada")
+    parser.add_argument("--turnos-conversa", dest="conversation_turns", type=int,
+                        help="Número padrão de falas do comando /conversar")
+    parser.add_argument("--conversas-simultaneas", dest="simultaneous_conversations", type=int,
+                        choices=(1, 2), help="Linhas privadas ativas por turno: 1 ou 2")
+    influence_group = parser.add_mutually_exclusive_group()
+    influence_group.add_argument("--influencia-culpado", dest="influence_enabled", action="store_true",
+                                 help="Permite ao culpado plantar suspeitas (padrão)")
+    influence_group.add_argument("--sem-influencia", dest="influence_enabled", action="store_false",
+                                 help="Desativa a conversa de influência do culpado")
+    parser.add_argument("--peso-influencia", dest="influence_weight", type=float,
+                        help="Peso da suspeita plantada pelo culpado (0 a 1)")
+    parser.add_argument("--delta-evidencia", dest="evidence_delta", type=float,
+                        help="Reforço base por evidência antes da confiabilidade (0 a 1)")
+    parser.add_argument("--confiabilidade-direta", dest="direct_reliability", type=float,
+                        help="Confiabilidade padrão para fatos de origem direta (0 a 1)")
+    parser.add_argument("--confiabilidade-repassada", dest="relayed_reliability", type=float,
+                        help="Confiabilidade padrão para fatos repassados (0 a 1)")
+    parser.add_argument("--limiar-deducao", dest="deduction_threshold", type=float,
+                        help="Confiança necessária para vitória por dedução (0 a 1)")
+    parser.add_argument("--fadiga-interrogatorio", dest="interrogation_fatigue", type=float,
+                        help="Penalidade por suspeito já interrogado")
+
+    parser.add_argument("--pasta", dest="actors_folder", help="Pasta dos arquivos .db dos atores")
+    parser.add_argument("--cenario", dest="scenario_folder", help="Pasta de cena.json e world.db")
+    parser.add_argument("--tema", dest="theme",
+                        help="Tema inicial; sem esta opção o programa pergunta no terminal")
+    parser.add_argument("--semente", dest="seed", type=int,
+                        help="Fixa decisões aleatórias para testes reproduzíveis")
+    parser.add_argument("--verificar-ambiente", dest="verify_environment", action="store_true",
+                        help="Verifica requisitos sem iniciar modelos nem alterar saves")
+    parser.add_argument("--mostrar-config", dest="show_config", action="store_true",
+                        help="Mostra configuração efetiva sem iniciar modelos ou alterar saves")
+    parser.set_defaults(
+        embeddings=None, influence_enabled=None, verify_environment=None, show_config=None,
+    )
+    return parser
+
+
+def parse_runtime_config(argv=None):
+    parser = build_argument_parser()
+    parsed = vars(parser.parse_args(argv))
+    config_path = parsed.pop("config_json")
+    defaults = RuntimeConfig(
+        model_actors=ServerManager.ACTORS_MODEL,
+        model_screenwriter=ServerManager.SCREENWRITER_MODEL,
+    )
+    settings = defaults.__dict__.copy()
+
+    if config_path:
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                file_settings = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as error:
+            parser.error(f"Não foi possível carregar --config-json: {error}")
+        if not isinstance(file_settings, dict):
+            parser.error("--config-json precisa conter um objeto JSON")
+        unknown = sorted(set(file_settings) - set(settings))
+        if unknown:
+            parser.error("Chaves desconhecidas em --config-json: " + ", ".join(unknown))
+        settings.update(file_settings)
+
+    settings.update({key: value for key, value in parsed.items() if value is not None})
+    try:
+        return RuntimeConfig(**settings).validate()
+    except (TypeError, ValueError, AttributeError) as error:
+        parser.error(f"Configuração inválida: {error}")
+
+
+def main():
+    config = parse_runtime_config()
+
+    if config.show_config:
+        print(json.dumps(config.__dict__, ensure_ascii=False, indent=2))
+        return
+
+    if config.seed is not None:
+        random.seed(config.seed)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     # Cria os dois gerenciadores (ainda não sobem o processo agora)
     actors_server = ServerManager(
-        model=args.modelo_atores,
-        port=args.porta_atores,
-        slots=args.slots,
-        context=4096,
-        threads=args.threads,
-        gpu_layers=args.camadas_gpu_atores,
-        embedding=True,  # memória semântica (Actor.recall_semantic); se a build do
-                        # llama.cpp não suportar, o Ator cai sozinho pra busca lexical
+        model=config.model_actors,
+        port=config.port_actors,
+        slots=config.slots_actors,
+        context=config.context_actors,
+        threads=config.threads,
+        gpu_layers=config.gpu_layers_actors,
+        embedding=config.embeddings,
     )
     screenwriter_server = ServerManager(
-        model=args.modelo_roteirista,
-        port=args.porta_roteirista,
-        slots=1,        # roteirista gera 1 cena de cada vez: 1 slot basta
-        context=8192,   # 14B precisa de contexto maior para gerar JSON longo
-        threads=args.threads,
-        gpu_layers=args.camadas_gpu_roteirista,
+        model=config.model_screenwriter,
+        port=config.port_screenwriter,
+        slots=config.slots_screenwriter,
+        context=config.context_screenwriter,
+        threads=config.threads,
+        gpu_layers=config.gpu_layers_screenwriter,
     )
 
     try:
         check_local_environment(
-            actors_server, screenwriter_server, args.pasta, args.cenario,
+            actors_server, screenwriter_server, config.actors_folder, config.scenario_folder,
         )
     except RuntimeError as error:
         print(f"\n[ambiente] {error}")
         raise SystemExit(1) from error
 
-    if args.verificar_ambiente:
+    if config.verify_environment:
         print("[ambiente] Verificação concluída; nenhum modelo foi iniciado e nenhum save foi alterado.")
         return
 
@@ -796,15 +934,18 @@ def main():
         try:
             llm = _start_fresh_game(
                 actors_server, screenwriter_server,
-                args.pasta, args.cenario, args.slots,
+                config.actors_folder, config.scenario_folder, config.slots_actors,
+                screenwriter_max_tokens=config.screenwriter_max_tokens,
+                screenwriter_temperature=config.screenwriter_temperature,
+                initial_theme=config.theme,
             )
         except Exception as error:
             print(f"\n[Erro ao iniciar novo save] {error}")
             raise SystemExit(1) from error
 
-        actors = load_actors(args.pasta, args.slots)
+        actors = load_actors(config.actors_folder, config.slots_actors, config=config)
         current = next(iter(actors.values()))
-        turns = 4
+        turns = config.conversation_turns
         debug_on = False
         print(HELP)
 
@@ -829,13 +970,14 @@ def main():
                     for name, ag in actors.items():
                         print(f"   {'*' if ag is current else ' '} {ag.name} (slot {ag.slot})")
                 elif command == "/cenario":
-                    cmd_scenario(args.cenario)
+                    cmd_scenario(config.scenario_folder)
                 elif command in ("/cena", "/sala"):
-                    cmd_scene(actors, rest, args.cenario, llm)
+                    cmd_scene(actors, rest, config.scenario_folder, llm, config=config)
                 elif command in ("/roteiro", "/roteirista"):
                     actors = cmd_screenplay(
                         actors_server, screenwriter_server,
-                        rest, args.pasta, args.cenario, args.slots, actors,
+                        rest, config.actors_folder, config.scenario_folder,
+                        config.slots_actors, actors, config=config,
                     )
                     # Após /roteiro o 7B voltou: recria o cliente LLM apontando para ele
                     llm = LLM(actors_server.url())
@@ -870,9 +1012,11 @@ def main():
                 elif command == "/tracos":
                     cmd_traits(current, rest)
                 elif command == "/novo":
-                    cmd_new(args.pasta, rest, actors, args.slots)
+                    cmd_new(config.actors_folder, rest, actors, config.slots_actors)
                     for ag in actors.values():
                         ag.debug = debug_on
+                        ag.llm_temperature = config.actor_temperature
+                        ag.llm_max_tokens = config.actor_max_tokens
                 elif command == "/turnos":
                     turns = max(1, int(rest)) if rest.isdigit() else turns
                     print(f"   Conversas entre atores terão {turns} falas.")

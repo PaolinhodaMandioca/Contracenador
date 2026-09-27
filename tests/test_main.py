@@ -1,6 +1,7 @@
 """Testes determinísticos de utilidades de main.py (o orquestrador). Não testa os comandos
 interativos inteiros (dependem de input()/terminal) - só a lógica pura que vale a pena isolar."""
 import os
+import json
 import socket
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from contracenador.cli.main import (
     _consume_actor_name,
     cmd_scene,
     load_actors,
+    parse_runtime_config,
     _run_private_dialogue,
     _record_revelation_evidence,
     _start_fresh_game,
@@ -73,6 +75,62 @@ class TestConsumeActorName(ActorTestCase):
         actor, rest = _consume_actor_name("Fulano de Tal algo", self.actors)
         self.assertIsNone(actor)
         self.assertEqual(rest, "Fulano de Tal algo")
+
+
+class TestRuntimeConfig(unittest.TestCase):
+
+    def test_defaults_match_existing_run_behavior(self):
+        config = parse_runtime_config([])
+
+        self.assertEqual(config.investigation_rounds, 10)
+        self.assertEqual(config.dialogue_rounds, 10)
+        self.assertEqual(config.conversation_turns, 4)
+        self.assertTrue(config.influence_enabled)
+        self.assertEqual(config.context_actors, 4096)
+        self.assertEqual(config.context_screenwriter, 8192)
+        self.assertIsNone(config.theme)
+
+    def test_cli_overrides_json_experiment_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "experiment.json")
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump({
+                    "investigation_rounds": 6,
+                    "dialogue_rounds": 4,
+                    "influence_enabled": False,
+                    "influence_weight": 0.4,
+                }, config_file)
+
+            config = parse_runtime_config([
+                "--config-json", path,
+                "--rodadas-investigacao", "3",
+                "--influencia-culpado",
+            ])
+
+        self.assertEqual(config.investigation_rounds, 3)
+        self.assertEqual(config.dialogue_rounds, 4)
+        self.assertTrue(config.influence_enabled)
+        self.assertEqual(config.influence_weight, 0.4)
+
+    def test_cli_can_set_theme_and_show_effective_config(self):
+        config = parse_runtime_config([
+            "--tema", "Uma joia desapareceu",
+            "--mostrar-config",
+            "--conversas-simultaneas", "1",
+        ])
+
+        self.assertEqual(config.theme, "Uma joia desapareceu")
+        self.assertTrue(config.show_config)
+        self.assertEqual(config.simultaneous_conversations, 1)
+
+    def test_invalid_experiment_config_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "invalid.json")
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump({"deduction_threshold": 1.5}, config_file)
+
+            with self.assertRaises(SystemExit):
+                parse_runtime_config(["--config-json", path])
 
 
 class TestServerManagerStartup(unittest.TestCase):
@@ -210,7 +268,7 @@ class TestPrivateDialogue(unittest.TestCase):
             screenwriter_server.stop.side_effect = lambda: events.append("screenwriter_stop")
             screenwriter_server.url.return_value = "http://screenwriter"
 
-            def generate_scene(llm, theme):
+            def generate_scene(llm, theme, **kwargs):
                 self.assertEqual(theme, "tema novo")
                 events.append("generate_scene")
                 return {"scene": "nova"}
@@ -502,7 +560,7 @@ class TestParallelInfluenceScene(unittest.TestCase):
             scenario_folder = os.path.join(temp, "cenario")
             materialize_scene(scene, actors_folder, scenario_folder, slots=2)
             actors = load_actors(actors_folder, slots=2)
-            actors["ana"].choose_investigation_target = lambda candidates, topic, llm: "Bia"
+            actors["ana"].choose_investigation_target = lambda candidates, topic, llm, **kwargs: "Bia"
             try:
                 with redirect_stdout(StringIO()):
                     cmd_scene(actors, "1", scenario_folder, FakeLLM())

@@ -71,15 +71,46 @@ iniciar modelos, baixar arquivos ou alterar saves:
 python main.py --verificar-ambiente
 ```
 
-A primeira cena será solicitada durante a inicialização. Flags úteis:
-Toda execução normal de `main.py` começa um save novo: limpa o conteúdo de `atores/` e `cenario/`,
-pergunta o tema, inicia primeiro o modelo de 14B para gerar a cena e depois carrega o modelo de
-7B para continuar o jogo. Os dados do save anterior são apagados permanentemente. Flags úteis:
+Para testar experiências, os parâmetros de servidor, geração e simulação podem ser definidos
+por flags ou num JSON. As flags informadas na linha de comando prevalecem sobre o arquivo.
+Para imprimir a configuração efetiva sem iniciar modelos:
 
 ```bash
-python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
-                --modelo-roteirista Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M \
-                --slots 2 --pasta atores --cenario cenario
+python main.py --config-json experimento.json --mostrar-config
+```
+
+```json
+{
+  "investigation_rounds": 8,
+  "dialogue_rounds": 6,
+  "simultaneous_conversations": 2,
+  "influence_enabled": true,
+  "influence_weight": 0.3,
+  "deduction_threshold": 0.7,
+  "actor_temperature": 0.8,
+  "theme": "Uma joia desapareceu durante um jantar",
+  "seed": 42
+}
+```
+
+As chaves JSON usam os nomes dos campos da configuração, em `snake_case`. Os controles mais
+usados também têm flags dedicadas:
+
+| Área | Flags |
+|---|---|
+| Modelos e servidor | `--modelo-atores`, `--modelo-roteirista`, `--porta-atores`, `--porta-roteirista`, `--slots`, `--slots-roteirista`, `--threads`, `--contexto-atores`, `--contexto-roteirista`, `--camadas-gpu-atores`, `--camadas-gpu-roteirista`, `--embeddings`, `--sem-embeddings` |
+| Geração e fala | `--temperatura-atores`, `--tokens-atores`, `--temperatura-investigador`, `--tokens-investigador`, `--temperatura-roteirista`, `--tokens-roteirista` |
+| Simulação | `--rodadas-investigacao`, `--rodadas-dialogo`, `--turnos-conversa`, `--conversas-simultaneas`, `--influencia-culpado`, `--sem-influencia`, `--peso-influencia`, `--delta-evidencia`, `--confiabilidade-direta`, `--confiabilidade-repassada`, `--limiar-deducao`, `--fadiga-interrogatorio` |
+| Experimento | `--config-json`, `--tema`, `--semente`, `--mostrar-config`, `--verificar-ambiente`, `--pasta`, `--cenario` |
+
+A primeira cena será solicitada durante a inicialização. Toda execução normal de `main.py`
+começa um save novo: limpa o conteúdo de `atores/` e `cenario/`,
+pergunta o tema, inicia primeiro o modelo de 14B para gerar a cena e depois carrega o modelo de
+7B para continuar o jogo. Os dados do save anterior são apagados permanentemente. Por exemplo,
+para testar uma investigação mais curta e sem influência do culpado:
+
+```bash
+python main.py --rodadas-investigacao 5 --rodadas-dialogo 4 --sem-influencia
 ```
 
 Por padrão, o llama-server recebe `--fit on` para ajustar automaticamente o offload às GPUs e à

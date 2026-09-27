@@ -85,7 +85,7 @@ def tactic_instruction(tactic, other, topic):
     return f'Pergunte a {other} o que sabe sobre "{topic}".'
 
 
-def suspicion_score(agent, candidate):
+def suspicion_score(agent, candidate, fatigue_weight=INTERROGATION_FATIGUE):
     belief = agent.belief(f"{candidate} é o culpado")
     suspicion = belief["confidence"] if belief else 0.0
     fatigue = agent.interrogation_counts.get(candidate, 0)
@@ -93,12 +93,16 @@ def suspicion_score(agent, candidate):
         0.6 * suspicion
         + 0.4 * agent.relationship(candidate)["distrust"]
         + (0.3 if candidate not in agent.satisfied else 0.0)
-        - INTERROGATION_FATIGUE * fatigue
+        - fatigue_weight * fatigue
     )
 
 
-def choose_investigation_target(agent, candidates, topic, llm, detect_subject):
-    scores = {candidate: suspicion_score(agent, candidate) for candidate in candidates}
+def choose_investigation_target(agent, candidates, topic, llm, detect_subject,
+                                temperature=0.3, max_tokens=20, fatigue_weight=None):
+    scores = {
+        candidate: suspicion_score(agent, candidate, fatigue_weight=fatigue_weight)
+        for candidate in candidates
+    }
     ranking = "\n".join(
         f"- {name}: suspeita {scores[name]:.2f}"
         + (" (já interrogado)" if name in agent.satisfied else "")
@@ -113,7 +117,7 @@ def choose_investigation_target(agent, candidates, topic, llm, detect_subject):
             f"Suspeitos e o quanto você já suspeita de cada um (0 a 1):\n{ranking}\n\n"
             "Quem você vai interrogar agora? Responda só com o nome.")},
     ]
-    answer = llm.generate(request, max_tokens=20, temperature=0.3) or ""
+    answer = llm.generate(request, max_tokens=max_tokens, temperature=temperature) or ""
     chosen = detect_subject(answer, candidates)
     if not chosen:
         chosen = max(candidates, key=lambda candidate: scores[candidate] + random.uniform(0.0, 0.01))

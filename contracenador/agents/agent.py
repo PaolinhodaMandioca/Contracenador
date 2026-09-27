@@ -804,7 +804,8 @@ class Actor:
         """
         return action_policy.suspicion_score(self, candidate)
 
-    def choose_investigation_target(self, candidates, topic, llm):
+    def choose_investigation_target(self, candidates, topic, llm, temperature=0.3,
+                                   max_tokens=20, fatigue_weight=0.12):
         """
         Quem interrogar agora, entre `candidates`? Diferente das outras decisões da classe,
         aqui o LLM entra como PLANEJADOR (roadmap, seções 12 e 19), não só como narrador: o
@@ -818,7 +819,10 @@ class Actor:
         ainda não é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os
         números) é uma extensão futura natural.
         """
-        return action_policy.choose_investigation_target(self, candidates, topic, llm, detect_subject)
+        return action_policy.choose_investigation_target(
+            self, candidates, topic, llm, detect_subject,
+            temperature=temperature, max_tokens=max_tokens, fatigue_weight=fatigue_weight,
+        )
 
     # ------------------------------------------------------------------
     # 4.5) PROMPTS: como a fala vira texto para o LLM
@@ -864,7 +868,13 @@ class Actor:
             # não se mistura visualmente com os logs cinza de decisão (ver _log).
             tint = colors.color_for_name(self.name)
             print(f"\n{colors.BOLD}{tint}[{self.name}]{colors.RESET} {tint}", end="", flush=True)
-        response = llm.generate(messages, slot=self.slot, live=self.verbose) or "..."
+        response = llm.generate(
+            messages,
+            max_tokens=getattr(self, "llm_max_tokens", 150),
+            temperature=getattr(self, "llm_temperature", 0.7),
+            slot=self.slot,
+            live=self.verbose,
+        ) or "..."
         if self.verbose:
             print(colors.RESET)  # fecha a cor e deixa uma linha em branco de respiro
         return response
