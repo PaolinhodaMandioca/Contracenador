@@ -20,6 +20,7 @@ import sys
 
 from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar
 from llm import LLM
+from mundo import abrir_mundo, posicionar, registrar_evento, registrar_evidencia, registrar_local
 
 SCHEMA_CENA = {
     "type": "object",
@@ -263,6 +264,24 @@ def materializar_cena(dados_cena, pasta_atores="atores", pasta_cenario="cenario"
         json.dump(dados_cena, f, ensure_ascii=False, indent=2)
     print(f"Metadados do cenário gravados em: {caminho_meta}")
 
+    # WorldState: a verdade objetiva do crime vira um EVENTO em mundo.db, não só uma string
+    # solta no cena.json. Hoje só existe 1 local (o Roteirista ainda não gera múltiplos - ver
+    # nota de escopo em mundo.py); por isso o evento é publico=False e cada testemunha que
+    # "viu" algo é ligada explicitamente como evidência, em vez de por percepção automática.
+    caminho_mundo = os.path.join(pasta_cenario, "mundo.db")
+    mundo = abrir_mundo(caminho_mundo)
+    registrar_local(mundo, "cena", descricao=dados_cena["cena"], publico=False)
+    for a_info in atores_dados:
+        posicionar(mundo, a_info["nome"], "cena", papel=a_info["papel"])
+
+    id_evento_crime = None
+    if culpado_nome:
+        culpado_info = next(a for a in atores_dados if a["papel"] == "culpado")
+        id_evento_crime, _ = registrar_evento(
+            mundo, "crime", ator=culpado_nome, local="cena",
+            dados={"proposicao": culpado_info["verdade"]}, publico=False)
+    print(f"Mundo (verdade objetiva) gravado em: {caminho_mundo}")
+
     atores_criados = {}
     for i, a_info in enumerate(atores_dados):
         nome = a_info["nome"]
@@ -314,12 +333,15 @@ def materializar_cena(dados_cena, pasta_atores="atores", pasta_cenario="cenario"
                 id_mem = ator.lembrar(viu, origem="observacao", sensibilidade=0.6,
                                       compartilhavel=1, sobre=culpado_nome)
                 print(f"   [Testemunha] {nome}: gravado fato observado sobre {culpado_nome} (memória #{id_mem}).")
+                if id_evento_crime is not None:
+                    registrar_evidencia(mundo, id_evento_crime, viu, origem=nome)
             else:
                 print(f"   [Testemunha] {nome}: não presenciou nada relevante (sem memórias iniciais).")
 
         ator.db.close()
         atores_criados[nome.lower()] = caminho_db
 
+    mundo.close()
     print(f"\nSucesso! {len(atores_criados)} atores materializados prontos para a cena.")
     return atores_criados
 

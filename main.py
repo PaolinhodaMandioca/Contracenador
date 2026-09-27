@@ -28,6 +28,7 @@ import time
 
 from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar, normalizar
 from llm import LLM
+from mundo import abrir_mundo, buscar_evento_tipo, registrar_evento
 from roteirista import gerar_cena_llm, materializar_cena
 
 
@@ -462,7 +463,18 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         return
 
     suspeitos = [a for a in atores.values() if a is not investigador]
-    verdade_exata = (culpado_info.get("verdade") or "").strip()
+
+    # A verdade vem do WorldState (mundo.db), não mais direto do cena.json: é o evento
+    # 'crime' gravado por materializar_cena(). Se por algum motivo o mundo não existir
+    # (cena antiga, gerada antes do WorldState), cai de volta no campo do cena.json.
+    caminho_mundo = os.path.join(pasta_cenario, "mundo.db")
+    mundo = abrir_mundo(caminho_mundo)
+    evento_crime = buscar_evento_tipo(mundo, "crime")
+    if evento_crime:
+        verdade_exata = (evento_crime["dados"].get("proposicao") or "").strip()
+    else:
+        verdade_exata = (culpado_info.get("verdade") or "").strip()
+
     topico = investigador_info.get("objetivo") or cenario_dados.get("cena", "O mistério")
 
     turnos_max = 15
@@ -533,6 +545,16 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         # 3) Investigador processa a resposta
         investigador.receber(envelope_resposta)
 
+        # 3b) WorldState: registra o que de fato aconteceu nesta rodada (não o que cada um
+        # ACREDITA - isso é o evento objetivo, separado da memória de cada Ator).
+        for env in (envelope_pergunta, envelope_resposta):
+            if env.get("tatica") == "AMEACAR":
+                registrar_evento(mundo, "ameaca", ator=env["de"], alvo=env.get("alvo"),
+                                  local="cena", dados={"proposicao": f'{env["de"]} ameaçou {env.get("alvo")}'})
+        if envelope_resposta.get("fatos"):
+            registrar_evento(mundo, "revelacao", ator=alvo.nome, alvo=investigador.nome,
+                              local="cena", dados={"proposicao": "; ".join(envelope_resposta["fatos"])})
+
         # 4) Plateia: os outros presentes na sala escutam tudo
         ouvintes = [a for a in suspeitos if a is not alvo]
         for ouvinte in ouvintes:
@@ -561,6 +583,7 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         print(f"\"{verdade_exata}\"")
         print(f"{'*' * 65}")
 
+    mundo.close()
     print("\n=== Resumo final dos personagens ===")
     print(investigador.resumo())
     print()
