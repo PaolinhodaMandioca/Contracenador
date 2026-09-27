@@ -113,12 +113,12 @@ def simular_uma_cena(semente, rodadas_max):
         mentiras, vencedor, rodadas_usadas = 0, "culpado_escapou", rodadas_max
 
         for rodada in range(1, rodadas_max + 1):
-            alvo = max(suspeitos, key=lambda s: (
-                0.6 * (ana.crenca(f"{s.nome} é o culpado") or {}).get("confianca", 0.0)
-                + 0.4 * ana.relacao(s.nome)["desconfianca"]
-                + (0.4 if s.nome not in ana.satisfeitos else 0.0)
-                + random.uniform(0.0, 0.2)
-            ))
+            # Mesmo mecanismo do jogo de verdade (main.cmd_cena): quem interrogar é decisão do
+            # investigador via escolher_investigado(). Como o LLM aqui é surdo-mudo, a resposta
+            # nunca casa com um nome e o código sempre cai no fallback por pontuação - o que é
+            # exatamente o comportamento que queremos calibrar.
+            nome_alvo = ana.escolher_investigado([s.nome for s in suspeitos], verdade, llm)
+            alvo = next(s for s in suspeitos if s.nome == nome_alvo)
 
             env_pergunta = ana.abrir_conversa(alvo.nome, verdade, llm)
             env_resposta = alvo.responder(env_pergunta, verdade, llm)

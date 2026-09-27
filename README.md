@@ -68,7 +68,7 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
 |---|---|
 | (texto normal) | Conversa com o Ator atual |
 | `/cenario` | Mostra o incidente e os personagens da cena atual |
-| `/cena [rodadas]` ou `/sala` | Encena a investigação: o investigador interroga até descobrir a verdade ou esgotar as rodadas (padrão 15) |
+| `/cena [rodadas]` ou `/sala` | Encena a investigação do início ao fim, sem pausa: o investigador decide sozinho quem interrogar a cada rodada, até descobrir a verdade ou esgotar as rodadas (padrão 15) |
 | `/roteiro [tema]` | Gera uma nova cena com 5 Atores via LLM (troca para o modelo do Roteirista e volta) |
 | `/atores` | Lista os Atores carregados |
 | `/falar <nome>` | Troca o Ator com quem você conversa |
@@ -134,6 +134,16 @@ confiança que evidências vão ajustando (`atualizar_crenca`). É o mesmo mecan
 social quanto para hipótese de investigação — o investigador de `/cena` forma e reforça a hipótese
 `"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
 **dedução** (confiança ≥ 75%) mesmo sem uma confissão. Veja com `/painel` (seção "HIPÓTESES").
+
+## Quem interrogar é sempre decisão do investigador
+
+Em `/cena`, ninguém escolhe por ele - nem o usuário (não há menu), nem um sorteio puro. A cada
+rodada, o código monta a lista de suspeitos com o quanto já se suspeita de cada um (crença já
+formada, desconfiança, quem já foi pressionado) e pede ao próprio LLM do investigador (o mesmo
+7B usado para falar) que escolha um nome dessa lista (`Ator.escolher_investigado`). O código
+sempre valida a resposta antes de agir: se o LLM não citar claramente um nome válido, quem
+decide é o código, pela pontuação. O LLM nunca pode travar o jogo nem inventar um alvo
+inexistente - a mesma filosofia de "LLM propõe, código decide" usada no resto do projeto.
 
 ## Objetivos e ações
 

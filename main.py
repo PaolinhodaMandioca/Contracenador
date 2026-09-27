@@ -20,13 +20,12 @@ import argparse
 import json
 import os
 import random
-import re
 import socket
 import subprocess
 import sys
 import time
 
-from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar, normalizar
+from Ator import Ator, TRACOS_PADRAO, criar_ator, detectar_sujeito, limitar
 from llm import LLM
 from mundo import abrir_mundo, buscar_evento_tipo, evidencias_por_origem, registrar_evento
 from roteirista import gerar_cena_llm, materializar_cena
@@ -226,17 +225,6 @@ def pedir_numero(pergunta, padrao):
         print("   Digite um número entre 0 e 1 (ou Enter para o padrão).")
 
 
-def detectar_sujeito(texto, nomes):
-    """
-    Acha, dentro do texto, o nome de um ator conhecido - ignora acento/maiúscula e
-    respeita fronteira de palavra (então 'Bianca' não casa com 'Bia'). Devolve o nome
-    (na grafia original) se achar exatamente um; None se não achar ou achar mais de um.
-    """
-    alvo = normalizar(texto)
-    achados = [nome for nome in nomes if re.search(rf"\b{re.escape(normalizar(nome))}\b", alvo)]
-    return achados[0] if len(achados) == 1 else None
-
-
 def cmd_cenario(pasta_cenario):
     dados = carregar_cenario(pasta_cenario)
     if not dados:
@@ -434,11 +422,15 @@ def cmd_conversar(atores, resto, turnos, llm):
 
 def cmd_cena(atores, resto, pasta_cenario, llm):
     """
-    Orquestra a dinâmica da 'Sala' (Contracenador com 5 atores):
-    - O Investigador interroga um dos outros atores a cada rodada.
+    Orquestra a dinâmica da 'Sala' (Contracenador com 5 atores), do início ao fim, sem pausa
+    interativa a cada rodada - o usuário só acompanha:
+    - A cada rodada, o Investigador decide SOZINHO quem interrogar (escolher_investigado, com
+      o LLM como planejador e o código validando a resposta - nunca um menu para o usuário
+      escolher, nunca um sorteio puro).
     - O par troca falas (abrir_conversa / responder).
     - Os outros presentes na sala escutam e processam o que ouviram via .receber(envelope).
-    - Fim dinâmico: a investigação vence se a 'verdade' entrar na memória do investigador;
+    - Fim dinâmico: a investigação vence se a 'verdade' entrar na memória do investigador (ou
+      se a crença "<suspeito> é o culpado" passar de 75% de confiança - vitória por dedução);
       o culpado vence por exaustão se atingir o teto de rodadas (padrão 15).
     """
     cenario_dados = carregar_cenario(pasta_cenario)
@@ -507,44 +499,14 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
 
     for rodada in range(1, turnos_max + 1):
         print(f"\n--- [Rodada {rodada}/{turnos_max}] ---")
-        print(f"Quem {investigador.nome} deve interrogar?")
-        for idx, s in enumerate(suspeitos, 1):
-            desconf = investigador.relacao(s.nome)["desconfianca"]
-            conhece = " (já interrogado)" if s.nome in investigador.satisfeitos else ""
-            print(f"   [{idx}] {s.nome} (desconfiança de {investigador.nome}: {desconf:.2f}){conhece}")
-        print("   [A] Automático (o investigador escolhe sozinho)")
-        print("   [S] Encerrar a cena agora")
 
-        escolha = input("Opção [A]: ").strip().lower()
-
-        if escolha in ("s", "sair", "exit", "q"):
-            print("\nCena encerrada pelo usuário.")
-            break
-
-        alvo = None
-        if escolha.isdigit() and 1 <= int(escolha) <= len(suspeitos):
-            alvo = suspeitos[int(escolha) - 1]
-        elif escolha in ("", "a", "auto", "automatico", "automático"):
-            # Heurística: prioriza quem ainda não foi interrogado, quem tem maior desconfiança
-            # e o principal suspeito segundo as crenças já formadas (ver atualizar_crenca acima).
-            def pontuacao(s):
-                crenca = investigador.crenca(f"{s.nome} é o culpado")
-                suspeita = crenca["confianca"] if crenca else 0.0
-                return (
-                    0.6 * suspeita
-                    + 0.4 * investigador.relacao(s.nome)["desconfianca"]
-                    + (0.4 if s.nome not in investigador.satisfeitos else 0.0)
-                    + random.uniform(0.0, 0.2)
-                )
-            alvo = max(suspeitos, key=pontuacao)
-            print(f"-> {investigador.nome} decide focar em {alvo.nome}.")
-        else:
-            achados = [s for s in suspeitos if normalizar(s.nome) == normalizar(escolha)]
-            if achados:
-                alvo = achados[0]
-            else:
-                alvo = suspeitos[0]
-                print(f"-> Opção não reconhecida. Focando em {alvo.nome}.")
+        # Quem interrogar é SEMPRE decisão do investigador, nunca do usuário nem de um sorteio
+        # solto: o código monta as opções e o contexto (suspeita já reunida), o LLM escolhe um
+        # nome da lista, e o código valida antes de seguir (ver escolher_investigado em Ator.py).
+        nomes_candidatos = [s.nome for s in suspeitos]
+        nome_alvo = investigador.escolher_investigado(nomes_candidatos, topico, llm)
+        alvo = atores[nome_alvo.lower()]
+        print(f"-> {investigador.nome} decide focar em {alvo.nome}.")
 
         print(f"\n[Interrogatório] {investigador.nome} aborda {alvo.nome}...")
 

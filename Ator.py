@@ -219,6 +219,19 @@ def palavras(texto):
             if len(p) >= 3 and p not in PALAVRAS_COMUNS}
 
 
+def detectar_sujeito(texto, nomes):
+    """
+    Acha, dentro do texto, o nome de um ator conhecido - ignora acento/maiúscula e
+    respeita fronteira de palavra (então 'Bianca' não casa com 'Bia'). Devolve o nome
+    (na grafia original) se achar exatamente um; None se não achar ou achar mais de um.
+    Usado tanto pelo orquestrador (main.py) quanto por escolher_investigado() abaixo, para
+    interpretar a resposta em texto livre de um LLM e casá-la com uma lista de nomes válidos.
+    """
+    alvo = normalizar(texto)
+    achados = [nome for nome in nomes if re.search(rf"\b{re.escape(normalizar(nome))}\b", alvo)]
+    return achados[0] if len(achados) == 1 else None
+
+
 # ============================================================================
 # 4) O AGENTE
 # ============================================================================
@@ -620,6 +633,62 @@ class Agente:
                     f'informações, contar aos outros que esconde coisas) para que conte o que '
                     f'sabe sobre "{topico}".')
         return f'Pergunte a {outro} o que sabe sobre "{topico}".'
+
+    def _pontuacao_suspeita(self, candidato):
+        """
+        O quanto eu suspeito de `candidato`, combinando a crença já formada (se houver
+        evidência ligando esse nome a "é o culpado") com a desconfiança da relação e um
+        empurrão para quem eu ainda não consegui arrancar nada. Serve tanto de contexto para
+        o LLM decidir (ver escolher_investigado) quanto de fallback caso ele não responda
+        nada aproveitável.
+        """
+        crenca = self.crenca(f"{candidato} é o culpado")
+        suspeita = crenca["confianca"] if crenca else 0.0
+        return (
+            0.6 * suspeita
+            + 0.4 * self.relacao(candidato)["desconfianca"]
+            + (0.3 if candidato not in self.satisfeitos else 0.0)
+        )
+
+    def escolher_investigado(self, candidatos, topico, llm):
+        """
+        Quem interrogar agora, entre `candidatos`? Diferente das outras decisões da classe,
+        aqui o LLM entra como PLANEJADOR (roadmap, seções 12 e 19), não só como narrador: o
+        código monta as opções e o contexto (suspeita já reunida sobre cada um), pede que o
+        LLM escolha UM nome, e SEMPRE valida a resposta antes de usá-la - se vier algo fora da
+        lista, ambíguo ou vazio, o código decide sozinho pela pontuação. O LLM nunca pode travar
+        o jogo nem inventar um alvo que não existe.
+
+        Escopo: a decisão hoje só considera os números já calculados (suspeita, desconfiança,
+        quem já foi pressionado) - não inclui o histórico de diálogo desta cena, que ainda não
+        é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os números)
+        é uma extensão futura natural.
+        """
+        pontuacoes = {c: self._pontuacao_suspeita(c) for c in candidatos}
+        ranking = "\n".join(
+            f"- {nome}: suspeita {p:.2f}" + (" (já interrogado)" if nome in self.satisfeitos else "")
+            for nome, p in sorted(pontuacoes.items(), key=lambda kv: -kv[1])
+        )
+        pedido = [
+            {"role": "system", "content": (
+                "Você é um investigador decidindo quem interrogar a seguir numa investigação. "
+                "Responda SOMENTE com o nome exato de uma pessoa da lista, sem mais nada.")},
+            {"role": "user", "content": (
+                f"Objetivo da investigação: {topico}\n\n"
+                f"Suspeitos e o quanto você já suspeita de cada um (0 a 1):\n{ranking}\n\n"
+                "Quem você vai interrogar agora? Responda só com o nome.")},
+        ]
+        resposta = llm.gerar(pedido, max_tokens=20, temperatura=0.3) or ""
+        escolhido = detectar_sujeito(resposta, candidatos)
+        if escolhido:
+            self._log(f"{self.nome} (LLM) decide interrogar {escolhido}.")
+            return escolhido
+
+        # Resposta do LLM não deu pra usar (vazia, ambígua, fora da lista): o código decide
+        # sozinho pela pontuação, com um empate mínimo quebrado ao acaso.
+        escolhido = max(candidatos, key=lambda c: pontuacoes[c] + random.uniform(0.0, 0.01))
+        self._log(f"{self.nome} (fallback do código) decide interrogar {escolhido}.")
+        return escolhido
 
     # ------------------------------------------------------------------
     # 4.5) PROMPTS: como a fala vira texto para o LLM

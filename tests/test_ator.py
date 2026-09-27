@@ -252,6 +252,47 @@ class TestEstadoERelacoes(TesteComAtores):
         self.assertGreater(joao.relacao("Carlos")["medo"], antes)
 
 
+class LLMDizNome:
+    """LLM falso que sempre 'escolhe' um nome específico, com texto ao redor (como um LLM de
+    verdade faria: 'Vou interrogar X agora.'), para testar escolher_investigado()."""
+
+    def __init__(self, nome):
+        self.nome = nome
+
+    def gerar(self, *args, **kwargs):
+        return f"Vou interrogar {self.nome} agora."
+
+
+class LLMRespostaInutilizavel:
+    """LLM falso que nunca dá uma resposta que bata com nenhum candidato."""
+
+    def gerar(self, *args, **kwargs):
+        return "Hmm, não sei bem o que dizer aqui."
+
+
+class TestEscolherInvestigado(TesteComAtores):
+    """escolher_investigado(): o investigador SEMPRE decide sozinho quem interrogar - nunca um
+    menu pro usuário, nunca um sorteio puro. O LLM propõe um nome; o código valida antes de
+    aceitar (roadmap, seções 12 e 19)."""
+
+    def test_aceita_a_escolha_valida_do_llm(self):
+        ana = self.criar_ator("Ana")
+        alvo = ana.escolher_investigado(["Bia", "Caio", "Joao"], "quem roubou", LLMDizNome("Caio"))
+        self.assertEqual(alvo, "Caio")
+
+    def test_resposta_invalida_cai_no_fallback_por_pontuacao(self):
+        ana = self.criar_ator("Ana")
+        ana.atualizar_crenca("Joao é o culpado", delta=0.3, assunto="Joao")
+        alvo = ana.escolher_investigado(["Bia", "Caio", "Joao"], "quem roubou",
+                                        LLMRespostaInutilizavel())
+        self.assertEqual(alvo, "Joao")  # maior pontuação (crença já formada sobre ele)
+
+    def test_nunca_escolhe_alguem_fora_da_lista(self):
+        ana = self.criar_ator("Ana")
+        alvo = ana.escolher_investigado(["Bia", "Caio"], "x", LLMDizNome("Pedro"))
+        self.assertIn(alvo, ["Bia", "Caio"])
+
+
 class TestPainel(unittest.TestCase):
 
     def test_barra_respeita_limites(self):
