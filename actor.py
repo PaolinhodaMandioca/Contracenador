@@ -42,6 +42,16 @@ HALF_LIFE = {"guilt": 1800, "fear": 900, "frustration": 600}
 # pressionando o culpado certo, sem nunca sequer tentar de novo a sorte de revelar.
 STANCE_PERSISTENCE = 3
 
+# Quanto cada interrogatório já feito a alguém desconta da PRÓXIMA vez que essa mesma pessoa é
+# avaliada como alvo (ver Actor._suspicion_score) - uma "fadiga" que cresce a cada vez que o
+# investigador já ouviu aquela pessoa, empurrando-o a distribuir as perguntas em vez de fixar
+# num só suspeito. Sem isso, o LLM (7B) que escolhe o alvo tende a sempre repetir quem aparece
+# primeiro na lista quando os placares empatam - e uma exclusão "dura" (tirar da lista após N
+# vezes seguidas) não resolve: vira um ciclo fechado entre só DOIS nomes, excluindo os outros
+# pra sempre (bug real observado num teste: o investigador ping-pongava só entre duas
+# testemunhas inocentes e nunca chegava a interrogar o culpado de novo).
+INTERROGATION_FATIGUE = 0.12
+
 # Traços de personalidade (0 a 1). Servem de "pesos" nas funções de decisão.
 DEFAULT_TRAITS = {
     "honesty": 0.5,          # tendência a falar a verdade
@@ -335,6 +345,7 @@ class Actor:
         self.debug = False        # modo debug: imprime o painel completo após cada resposta
         self.last_decision = {}   # interlocutor -> dados do último turno (para o painel de debug)
         self._no_embedding = False  # True assim que o servidor recusar embeddings 1x (ver _recall_best)
+        self.interrogation_counts = {}  # candidato -> quantas vezes já foi escolhido como alvo
 
     def _log(self, message):
         if self.verbose:
@@ -550,12 +561,19 @@ class Actor:
         """
         Ajusta a confiança de uma crença por `delta` (positivo reforça, negativo enfraquece),
         criando-a com confiança-base 0.5 se ainda não existir. Cada evidência que motivou a
-        mudança fica registrada (útil para reconstruir por que o Ator acredita nisso).
+        mudança fica registrada (útil para reconstruir por que o Ator acredita nisso) - e se
+        essa MESMA evidência (mesmo texto/id em `evidence`) já tinha sido contada antes, o
+        delta não é somado de novo. Sem essa checagem, reinterrogar a mesma testemunha sobre o
+        mesmo caso reaplicava o mesmo reforço de crença a cada vez (evidence_by_origin() devolve
+        sempre os mesmos registros do world.db), inflando a confiança rápido demais só por
+        perguntar de novo, não por haver algo novo.
         """
         c = self.form_belief(proposition, confidence=0.5, origin=origin, subject=subject)
-        new_confidence = clamp(c["confidence"] + delta)
         evidence_list = c["evidence"]
-        if evidence and evidence not in evidence_list:
+        if evidence is not None and evidence in evidence_list:
+            return c
+        new_confidence = clamp(c["confidence"] + delta)
+        if evidence is not None:
             evidence_list.append(evidence)
         self.db.execute(
             "UPDATE beliefs SET confidence=?, origin=?, subject=?, evidence=?, updated_at=? "
@@ -794,17 +812,23 @@ class Actor:
     def _suspicion_score(self, candidate):
         """
         O quanto eu suspeito de `candidate`, combinando a crença já formada (se houver
-        evidência ligando esse nome a "é o culpado") com a desconfiança da relação e um
-        empurrão para quem eu ainda não consegui arrancar nada. Serve tanto de contexto para
-        o LLM decidir (ver choose_investigation_target) quanto de fallback caso ele não
-        responda nada aproveitável.
+        evidência ligando esse nome a "é o culpado") com a desconfiança da relação, um
+        empurrão para quem eu ainda não consegui arrancar nada, e uma FADIGA que desconta
+        conforme eu já insisti nessa mesma pessoa (ver INTERROGATION_FATIGUE) - sem isso, uma
+        vez que alguém vira o principal suspeito ele nunca perde a prioridade, e o
+        investigador trava nele pro resto da cena em vez de ouvir as outras pontas (bug real
+        relatado pelo usuário). Serve tanto de contexto para o LLM decidir (ver
+        choose_investigation_target) quanto de fallback caso ele não responda nada
+        aproveitável.
         """
         belief = self.belief(f"{candidate} é o culpado")
         suspicion = belief["confidence"] if belief else 0.0
+        fatigue = self.interrogation_counts.get(candidate, 0)
         return (
             0.6 * suspicion
             + 0.4 * self.relationship(candidate)["distrust"]
             + (0.3 if candidate not in self.satisfied else 0.0)
+            - INTERROGATION_FATIGUE * fatigue
         )
 
     def choose_investigation_target(self, candidates, topic, llm):
@@ -817,14 +841,14 @@ class Actor:
         o jogo nem inventar um alvo que não existe.
 
         Escopo: a decisão hoje só considera os números já calculados (suspeita, desconfiança,
-        quem já foi pressionado) - não inclui o histórico de diálogo desta cena, que ainda não
-        é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os números)
-        é uma extensão futura natural.
+        quem já foi pressionado, fadiga) - não inclui o histórico de diálogo desta cena, que
+        ainda não é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os
+        números) é uma extensão futura natural.
         """
         scores = {c: self._suspicion_score(c) for c in candidates}
         ranking = "\n".join(
-            f"- {name}: suspeita {p:.2f}" + (" (já interrogado)" if name in self.satisfied else "")
-            for name, p in sorted(scores.items(), key=lambda kv: -kv[1])
+            f"- {name}: suspeita {scores[name]:.2f}" + (" (já interrogado)" if name in self.satisfied else "")
+            for name in sorted(candidates, key=lambda c: -scores[c])
         )
         request = [
             {"role": "system", "content": (
@@ -837,14 +861,15 @@ class Actor:
         ]
         answer = llm.generate(request, max_tokens=20, temperature=0.3) or ""
         chosen = detect_subject(answer, candidates)
-        if chosen:
+        if not chosen:
+            # Resposta do LLM não deu pra usar (vazia, ambígua, fora da lista): o código decide
+            # sozinho pela pontuação, com um empate mínimo quebrado ao acaso.
+            chosen = max(candidates, key=lambda c: scores[c] + random.uniform(0.0, 0.01))
+            self._log(f"{self.name} (fallback do código) decide interrogar {chosen}.")
+        else:
             self._log(f"{self.name} (LLM) decide interrogar {chosen}.")
-            return chosen
 
-        # Resposta do LLM não deu pra usar (vazia, ambígua, fora da lista): o código decide
-        # sozinho pela pontuação, com um empate mínimo quebrado ao acaso.
-        chosen = max(candidates, key=lambda c: scores[c] + random.uniform(0.0, 0.01))
-        self._log(f"{self.name} (fallback do código) decide interrogar {chosen}.")
+        self.interrogation_counts[chosen] = self.interrogation_counts.get(chosen, 0) + 1
         return chosen
 
     # ------------------------------------------------------------------
