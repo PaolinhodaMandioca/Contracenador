@@ -89,8 +89,9 @@ Regras que valem a pena conhecer:
   modelo de 3B (seguir instruções, gerar boas versões falsas) ainda precisa ser visto na prática.
   Alguns modelos se recusam a escrever ameaças; se for o caso, suavize o texto em `instrucao_tatica()`
   ou escolha outro modelo.
-- Busca de memória por palavras em comum (sem embeddings): a pergunta precisa usar palavras parecidas
-  com as do fato.
+- A busca de memória usa FTS5 quando disponível, com remoção de acentos, prefixos e ranking por
+  relevância. Em instalações SQLite sem FTS5, o código mantém a busca lexical simples como fallback;
+  a busca continua textual, sem entender equivalência semântica.
 - Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções e
   relações ficam no `.db`.
 - Contradições não são detectadas (se um agente mente e depois confessa, o outro fica com as duas versões).
@@ -98,7 +99,7 @@ Regras que valem a pena conhecer:
 
 ## Próximos passos (fora do "simples")
 
-1. FTS5 ou embeddings pequenos (`fastembed`, `sqlite-vec`) na busca de memória.
+1. Embeddings pequenos (`fastembed`, `sqlite-vec`) como complemento semântico à busca textual FTS5.
 2. Mais táticas (barganhar, blefar) e "alavanca" para ameaças: coluna `sobre` em `memorias`.
 3. Detectar contradições e subir a desconfiança.
 4. Extração automática de fatos com saída estruturada (JSON schema / GBNF) e resumo do histórico.
