@@ -52,6 +52,18 @@ STANCE_PERSISTENCE = 3
 # testemunhas inocentes e nunca chegava a interrogar o culpado de novo).
 INTERROGATION_FATIGUE = 0.12
 
+# Ninguém pode ser escolhido mais que isso À FRENTE de quem foi MENOS interrogado até agora (ver
+# choose_investigation_target) - sai de vez das OPÇÕES oferecidas ao LLM, não só perde pontuação.
+# Bug real observado ao vivo: a fadiga em _suspicion_score só influencia o RANKING mostrado e o
+# fallback do código; o LLM em si escolhe livremente qualquer nome da lista de candidatos e pode
+# simplesmente ignorar o placar - um 7B chegou a escolher a MESMA testemunha (sem nada a
+# revelar) nas 20 rodadas de uma cena inteira. Um teto ABSOLUTO ("no máximo N vezes") foi a
+# primeira tentativa e tinha um furo: assim que TODO MUNDO batia o teto (cada um sua vez), a
+# lista de exclusão ficava vazia de vez, e o travamento voltava para o resto da cena - visto ao
+# vivo num teste (uma testemunha sem nada a revelar dominou as últimas 8 rodadas de 20). Um
+# limite RELATIVO ao mínimo atual não tem esse furo: continua valendo a cena inteira.
+INTERROGATION_MARGIN = 2
+
 # Traços de personalidade (0 a 1). Servem de "pesos" nas funções de decisão.
 DEFAULT_TRAITS = {
     "honesty": 0.5,          # tendência a falar a verdade
@@ -844,11 +856,21 @@ class Actor:
         quem já foi pressionado, fadiga) - não inclui o histórico de diálogo desta cena, que
         ainda não é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os
         números) é uma extensão futura natural.
+
+        TETO DE INSISTÊNCIA: quem já foi escolhido mais que INTERROGATION_MARGIN vezes à frente
+        de quem foi MENOS interrogado até agora sai de vez das opções oferecidas ao LLM (não só
+        perde pontuação no ranking) - a fadiga sozinha influencia o que é MOSTRADO, mas não
+        impede o LLM de simplesmente ignorá-la e repetir o mesmo nome; bug real observado ao
+        vivo (um 7B interrogou a mesma testemunha sem nada a revelar por 20 rodadas seguidas).
         """
-        scores = {c: self._suspicion_score(c) for c in candidates}
+        counts = {c: self.interrogation_counts.get(c, 0) for c in candidates}
+        floor = min(counts.values())
+        options = [c for c in candidates if counts[c] <= floor + INTERROGATION_MARGIN]
+
+        scores = {c: self._suspicion_score(c) for c in options}
         ranking = "\n".join(
             f"- {name}: suspeita {scores[name]:.2f}" + (" (já interrogado)" if name in self.satisfied else "")
-            for name in sorted(candidates, key=lambda c: -scores[c])
+            for name in sorted(options, key=lambda c: -scores[c])
         )
         request = [
             {"role": "system", "content": (
@@ -860,11 +882,11 @@ class Actor:
                 "Quem você vai interrogar agora? Responda só com o nome.")},
         ]
         answer = llm.generate(request, max_tokens=20, temperature=0.3) or ""
-        chosen = detect_subject(answer, candidates)
+        chosen = detect_subject(answer, options)
         if not chosen:
             # Resposta do LLM não deu pra usar (vazia, ambígua, fora da lista): o código decide
             # sozinho pela pontuação, com um empate mínimo quebrado ao acaso.
-            chosen = max(candidates, key=lambda c: scores[c] + random.uniform(0.0, 0.01))
+            chosen = max(options, key=lambda c: scores[c] + random.uniform(0.0, 0.01))
             self._log(f"{self.name} (fallback do código) decide interrogar {chosen}.")
         else:
             self._log(f"{self.name} (LLM) decide interrogar {chosen}.")
