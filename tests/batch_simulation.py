@@ -124,13 +124,23 @@ def simulate_one_scene(seed, max_rounds):
         llm = DeafMuteLLM()
         lies, winner, rounds_used = 0, "guilty_escaped", max_rounds
 
+        # Mesma ronda inicial de main.cmd_scene: as primeiras rodadas (uma por suspeito) ouvem
+        # todo mundo antes de começar a focar suspeita em alguém - ver Actor.mark_interrogated.
+        canvass_order = suspects[:]
+        random.shuffle(canvass_order)
+
         for round_ in range(1, max_rounds + 1):
-            # Mesmo mecanismo do jogo de verdade (main.cmd_scene): quem interrogar é decisão do
-            # investigador via choose_investigation_target(). Como o LLM aqui é surdo-mudo, a
-            # resposta nunca casa com um nome e o código sempre cai no fallback por pontuação -
-            # o que é exatamente o comportamento que queremos calibrar.
-            target_name = ana.choose_investigation_target([s.name for s in suspects], truth, llm)
-            target = next(s for s in suspects if s.name == target_name)
+            if round_ <= len(canvass_order):
+                target = canvass_order[round_ - 1]
+                ana.mark_interrogated(target.name)
+            else:
+                # Mesmo mecanismo do jogo de verdade (main.cmd_scene): quem interrogar é decisão
+                # do investigador via choose_investigation_target(). Como o LLM aqui é
+                # surdo-mudo, a resposta nunca casa com um nome e o código sempre cai no
+                # fallback por pontuação - o que é exatamente o comportamento que queremos
+                # calibrar.
+                target_name = ana.choose_investigation_target([s.name for s in suspects], truth, llm)
+                target = next(s for s in suspects if s.name == target_name)
 
             question_env = ana.open_conversation(target.name, truth, llm)
             answer_env = target.respond(question_env, truth, llm)

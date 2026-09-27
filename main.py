@@ -550,17 +550,31 @@ def cmd_scene(actors, rest, scenario_folder, llm):
 
     victory = False
 
+    # RONDA INICIAL: nas primeiras rodadas (uma por suspeito), o investigador ouve TODO MUNDO
+    # antes de focar suspeita em alguém - decisão do CÓDIGO, sem chamar o LLM. Um 7B planeja mal
+    # com pouca informação (roadmap): pedir pra ele escolher o alvo desde a rodada 1 fazia a
+    # suspeita se fixar cedo demais em alguém aleatório, e a cena podia terminar sem nunca ter
+    # ouvido testemunhas com informação real. Só depois que todos já falaram uma vez é que
+    # choose_investigation_target() (LLM + fadiga + pontuação) assume a escolha do alvo.
+    canvass_order = suspects[:]
+    random.shuffle(canvass_order)
+
     for round_ in range(1, max_rounds + 1):
         print(colors.heading(f"\n--- [Rodada {round_}/{max_rounds}] ---"))
 
-        # Quem interrogar é SEMPRE decisão do investigador, nunca do usuário nem de um sorteio
-        # solto: o código monta as opções e o contexto (suspeita já reunida), o LLM escolhe um
-        # nome da lista, e o código valida antes de seguir (ver choose_investigation_target em
-        # actor.py).
-        candidate_names = [s.name for s in suspects]
-        target_name = investigator.choose_investigation_target(candidate_names, topic, llm)
-        target = actors[target_name.lower()]
-        print(colors.dim(f"-> {investigator.name} decide focar em {target.name}."))
+        if round_ <= len(canvass_order):
+            target = canvass_order[round_ - 1]
+            investigator.mark_interrogated(target.name)
+            print(colors.dim(f"-> {investigator.name} decide ouvir {target.name} primeiro (ronda inicial)."))
+        else:
+            # Quem interrogar é SEMPRE decisão do investigador, nunca do usuário nem de um
+            # sorteio solto: o código monta as opções e o contexto (suspeita já reunida), o LLM
+            # escolhe um nome da lista, e o código valida antes de seguir (ver
+            # choose_investigation_target em actor.py).
+            candidate_names = [s.name for s in suspects]
+            target_name = investigator.choose_investigation_target(candidate_names, topic, llm)
+            target = actors[target_name.lower()]
+            print(colors.dim(f"-> {investigator.name} decide focar em {target.name}."))
 
         print(colors.dim(f"\n[Interrogatório] {investigator.name} aborda {target.name}..."))
 
@@ -719,12 +733,14 @@ def main():
     )
 
     try:
-        # Sobe o servidor dos atores ao iniciar
-        actors_server.start()
-        llm = LLM(actors_server.url())
+        no_actors = not any(f.endswith(".db") for f in os.listdir(args.pasta))
 
-        # Se a pasta de atores estiver vazia, aciona o roteirista imediatamente
-        if not any(f.endswith(".db") for f in os.listdir(args.pasta)):
+        if no_actors:
+            # Ainda NÃO sobe servidor nenhum: pergunta o tema primeiro, só depois decide qual
+            # modelo carregar. Bug real relatado pelo usuário: antes, o 7B (dos Atores) era
+            # sempre carregado de cara mesmo sem nenhum ator existir - e minutos depois, assim
+            # que o usuário digitava o tema, era derrubado na hora pra subir o 14B (Roteirista)
+            # em cima, desperdiçando todo o tempo de carga do 7B à toa.
             print(f"\n[Aviso] Nenhum ator encontrado em '{args.pasta}/'.")
             print("Vamos gerar uma nova cena com o Roteirista (14B)!")
             theme = ""
@@ -734,21 +750,24 @@ def main():
                     print("Por favor, digite um tema para a IA criar o mistério.")
             try:
                 print("\n[roteiro] Carregando modelo do Roteirista (14B)...")
-                actors_server.stop()
                 screenwriter_server.start()
                 screenwriter_llm = LLM(screenwriter_server.url())
                 data = generate_scene_llm(screenwriter_llm, theme)
                 materialize_scene(data, actors_folder=args.pasta, scenario_folder=args.cenario, slots=args.slots)
-                print("\n[roteiro] Voltando ao modelo dos atores (7B)...")
+                print("\n[roteiro] Carregando modelo dos atores (7B)...")
                 screenwriter_server.stop()
                 actors_server.start()
                 llm = LLM(actors_server.url())
             except Exception as e:
                 print(f"\n[Erro ao criar cena com LLM] {e}")
+                screenwriter_server.stop()
                 if not actors_server.is_running():
                     actors_server.start()
                     llm = LLM(actors_server.url())
                 sys.exit(1)
+        else:
+            actors_server.start()
+            llm = LLM(actors_server.url())
 
         actors = load_actors(args.pasta, args.slots)
         current = next(iter(actors.values()))

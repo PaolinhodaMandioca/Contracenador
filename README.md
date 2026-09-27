@@ -49,8 +49,9 @@ manual.
 python main.py
 ```
 
-Se a pasta `atores/` estiver vazia, o programa já pergunta o tema e chama o Roteirista para criar
-a primeira cena. Flags úteis:
+Se a pasta `atores/` estiver vazia, o programa pergunta o tema ANTES de subir qualquer servidor
+e carrega direto o Roteirista (14B) para criar a primeira cena - só depois troca para o modelo
+dos Atores (7B). Nenhum servidor fica sendo carregado e derrubado à toa nesse fluxo. Flags úteis:
 
 ```bash
 python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
@@ -152,13 +153,23 @@ segue em frente com o que ele escreveu (nunca trava a geração por isso).
 
 ## Quem interrogar é sempre decisão do investigador
 
-Em `/cena`, ninguém escolhe por ele - nem o usuário (não há menu), nem um sorteio puro. A cada
-rodada, o código monta a lista de suspeitos com o quanto já se suspeita de cada um (crença já
-formada, desconfiança, quem já foi pressionado) e pede ao próprio LLM do investigador (o mesmo
-7B usado para falar) que escolha um nome dessa lista (`Actor.choose_investigation_target`). O
-código sempre valida a resposta antes de agir: se o LLM não citar claramente um nome válido,
-quem decide é o código, pela pontuação. O LLM nunca pode travar o jogo nem inventar um alvo
-inexistente - a mesma filosofia de "LLM propõe, código decide" usada no resto do projeto.
+Em `/cena`, ninguém escolhe por ele - nem o usuário (não há menu), nem um sorteio puro. As
+primeiras rodadas (uma por suspeito) são uma **ronda inicial**: o investigador ouve TODO MUNDO
+uma vez, por decisão direta do código, sem chamar o LLM - um 7B planeja mal com pouca
+informação, e sem essa ronda ele podia fixar a suspeita cedo demais em alguém aleatório e gastar
+a cena inteira sem nunca ouvir testemunhas com informação real.
+
+Só depois que todos já falaram uma vez é que a escolha do alvo passa para
+`Actor.choose_investigation_target`: a cada rodada, o código monta a lista de suspeitos com o
+quanto já se suspeita de cada um (crença já formada, desconfiança, quem já foi pressionado, e
+uma "fadiga" que desconta de quem já foi muito interrogado) e pede ao próprio LLM do
+investigador (o mesmo 7B usado para falar) que escolha um nome dessa lista. O código sempre
+valida a resposta antes de agir: se o LLM não citar claramente um nome válido, quem decide é o
+código, pela pontuação; e quem já foi interrogado demais na frente de quem foi menos ouvido sai
+de vez das opções oferecidas (não é só descontado na pontuação - um teste real mostrou que o LLM
+pode simplesmente ignorar a pontuação e insistir no mesmo nome). O LLM nunca pode travar o jogo
+nem inventar um alvo inexistente - a mesma filosofia de "LLM propõe, código decide" usada no
+resto do projeto.
 
 ## Objetivos e ações
 

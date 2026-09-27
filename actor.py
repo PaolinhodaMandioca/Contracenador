@@ -894,6 +894,16 @@ class Actor:
         self.interrogation_counts[chosen] = self.interrogation_counts.get(chosen, 0) + 1
         return chosen
 
+    def mark_interrogated(self, candidate):
+        """Registra `candidate` como interrogado sem chamar o LLM nem passar por
+        choose_investigation_target(). Usado pela RONDA INICIAL de cmd_scene() (main.py): antes
+        de focar suspeita em alguém, o investigador ouve todo mundo uma vez por decisão do
+        próprio código, não do LLM - um 7B planeja mal com pouca informação e, sem isso, girava
+        a atenção cedo demais e podia gastar a cena inteira sem nunca ter ouvido testemunhas com
+        informação real. Mantém o contador de fadiga (ver _suspicion_score) consistente mesmo
+        pulando o LLM."""
+        self.interrogation_counts[candidate] = self.interrogation_counts.get(candidate, 0) + 1
+
     # ------------------------------------------------------------------
     # 4.5) PROMPTS: como a fala vira texto para o LLM
     # ------------------------------------------------------------------
