@@ -420,17 +420,17 @@ class TestRevelationEvidence(ActorTestCase):
     def test_belief_update_scales_with_evidence_reliability_and_deduplicates(self):
         investigator = self.create_actor("Ana")
         event_id, _ = register_event(
-            self.world, "testimony", actor="Bia", location="cena", public=False,
+            self.world, "revelation", actor="Bia", target="Ana", location="cena", public=False,
         )
-        register_evidence(
+        evidence_id = register_evidence(
             self.world, event_id, "Joao estava perto da joia.",
-            origin="Bia", subject="Joao", reliability=0.25,
+            origin="Bia", subject="Joao", reliability=0.25, effect="supports",
         )
         processed = set()
 
-        _update_beliefs_from_evidence(investigator, self.world, "Bia", processed)
+        _update_beliefs_from_evidence(investigator, self.world, [evidence_id], processed)
         first_confidence = investigator.belief("Joao é o culpado")["confidence"]
-        _update_beliefs_from_evidence(investigator, self.world, "Bia", processed)
+        _update_beliefs_from_evidence(investigator, self.world, [evidence_id], processed)
         second_confidence = investigator.belief("Joao é o culpado")["confidence"]
 
         self.assertAlmostEqual(first_confidence, 0.55)

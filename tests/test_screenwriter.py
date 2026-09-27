@@ -203,9 +203,16 @@ class TestMaterializeScene(unittest.TestCase):
 
         joao = Actor(os.path.join(self.actors_folder, "joao.db"), slot=0)
         self.assertIsNotNone(joao.goal("Não ser descoberto"))
+        self.assertEqual(joao.list_memories()[0]["protected_by_goal"],
+                         joao.goal("Não ser descoberto")["id"])
 
         ana = Actor(os.path.join(self.actors_folder, "ana.db"), slot=0)
         self.assertIsNotNone(ana.goal("Achar a joia"))
+        self.assertEqual(ana.recall("joia", shareable_only=True), [])
+        self.assertEqual(ana.list_memories()[0]["kind"], "context")
+        self.assertIn("Achar a joia", ana._messages("Joao", "pergunte")[-1]["content"])
+        joao.db.close()
+        ana.db.close()
 
 
 if __name__ == "__main__":

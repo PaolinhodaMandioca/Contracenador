@@ -27,6 +27,7 @@ SCENE_SCHEMA = {
                     "alibi": {"type": ["string", "null"]},
                     "goal": {"type": ["string", "null"]},
                     "saw": {"type": ["string", "null"]},
+                    "saw_effect": {"type": "string", "enum": ["supports", "refutes", "neutral"]},
                 },
                 "required": ["name", "description", "examples", "traits", "role"],
             },
@@ -83,6 +84,9 @@ def validate_scene_data(data):
         if not name or not isinstance(name, str):
             raise ValueError("Cada personagem deve ter um 'name' válido.")
         role = character.get("role")
+        if character.get("saw_effect", "neutral") not in {"supports", "refutes", "neutral"}:
+            raise ValueError(f"saw_effect inválido para {name}")
+        character.setdefault("saw_effect", "neutral")
         if role == "guilty":
             if not character.get("truth"):
                 raise ValueError(f"O culpado ({name}) precisa ter o campo 'truth' preenchido.")

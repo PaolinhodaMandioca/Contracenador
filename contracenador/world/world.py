@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     origin       TEXT,                        -- quem forneceu a evidência
     subject      TEXT,                        -- de quem/o que ela é evidência (ex.: suspeito)
     reliability  REAL DEFAULT 0.7,
+    effect       TEXT DEFAULT 'neutral', -- 'supports' | 'refutes' | 'neutral' (hipótese de culpa)
     timestamp    REAL
 );
 """
@@ -88,6 +89,12 @@ def open_world(path):
     db.executescript(PRAGMAS + TABLES)
     if db.execute("PRAGMA user_version").fetchone()[0] == 0:
         db.executescript(MARK)
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(evidence)")}
+    if "effect" not in columns:
+        # Texto legado sem classificação não vira acusação por suposição.
+        db.execute("ALTER TABLE evidence ADD COLUMN effect TEXT DEFAULT 'neutral'")
+    db.execute("PRAGMA user_version = 2")
+    db.commit()
     return db
 
 

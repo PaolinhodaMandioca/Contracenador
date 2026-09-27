@@ -37,12 +37,12 @@ from ..simulation import (
 )
 from ..simulation.config import RuntimeConfig
 from ..world import (
-    evidence_by_origin,
     find_event_by_type,
     open_world,
     register_event,
     register_evidence,
 )
+from ..world.evidence import EVIDENCE_EFFECTS, delivered_evidence
 
 DIALOGUE_ROUNDS = DEFAULT_PAIR_ROUNDS
 
@@ -456,7 +456,10 @@ def _record_revelation_evidence(world, envelope, character_names, recorded_revel
         text = fact.get("text", "").strip()
         if not text:
             continue
-        key = (speaker, fact.get("source_id"), text)
+        effect = fact.get("effect", "neutral")
+        if effect not in EVIDENCE_EFFECTS:
+            effect = "neutral"
+        key = (speaker, envelope.get("target"), fact.get("source_id"), text, effect)
         if key in recorded_revelations:
             continue
 
@@ -466,42 +469,44 @@ def _record_revelation_evidence(world, envelope, character_names, recorded_revel
         if subject is None and fact.get("origin") == "system":
             subject = speaker
 
-        existing = next((
-            item for item in evidence_by_origin(world, speaker)
-            if item["content"] == text and item["subject"] == subject
-        ), None)
         default_reliability = (
             direct_reliability if fact.get("origin") in {"system", "observation", "user"}
             else relayed_reliability
         )
-        reliability = fact.get(
-            "reliability", existing["reliability"] if existing else default_reliability,
-        )
+        reliability = fact.get("reliability", default_reliability)
         event_id, _ = register_event(
             world, "revelation", actor=speaker, target=envelope.get("target"),
             location="cena", data={"proposition": text}, public=False,
         )
         evidence_ids.append(register_evidence(
             world, event_id, text, origin=speaker, subject=subject,
-            type_="testimony", reliability=reliability,
+            type_="testimony", reliability=reliability, effect=effect,
         ))
         recorded_revelations.add(key)
     return evidence_ids
 
 
-def _update_beliefs_from_evidence(investigator, world, origin, processed_evidence, delta=0.2):
-    """Aplica cada testemunho uma vez, ponderando o reforço pela confiabilidade."""
-    for evidence in evidence_by_origin(world, origin):
-        key = (evidence["origin"], evidence["subject"], evidence["content"])
-        if (key in processed_evidence or not evidence["subject"]
+def _update_beliefs_from_evidence(investigator, world, evidence_ids, processed_evidence, delta=0.2):
+    """Usa só os relatos entregues; mencionar alguém não implica acusá-lo."""
+    for evidence_id in evidence_ids:
+        evidence = delivered_evidence(world, evidence_id, investigator.name)
+        if evidence is None:
+            continue
+        # Referência estável também evita reforço repetido entre chamadas de /cena.
+        key = "testimony:" + json.dumps(
+            [evidence["origin"], evidence["subject"], evidence["content"], evidence["effect"]],
+            ensure_ascii=False,
+        )
+        direction = EVIDENCE_EFFECTS.get(evidence["effect"], 0)
+        if (key in processed_evidence or not direction or not evidence["subject"]
             or evidence["subject"] == investigator.name
             or evidence["type"] != "testimony"):
             continue
         processed_evidence.add(key)
         reliability = clamp(float(evidence.get("reliability", 0.7)))
         investigator.update_belief(
-            f"{evidence['subject']} é o culpado", delta=delta * reliability,
-            origin=origin, subject=evidence["subject"], evidence=f"evidence:{evidence['id']}",
+            f"{evidence['subject']} é o culpado", delta=direction * delta * reliability,
+            origin=evidence["origin"], subject=evidence["subject"], evidence=key,
         )
 
 
@@ -663,6 +668,7 @@ def cmd_scene(actors, rest, scenario_folder, llm, config=None):
             f"{dialogue_round}/{dialogue_rounds}"
         ))
 
+        delivered_ids = []
         for env in (question_envelope, answer_envelope):
             if env.get("tactic") == "THREATEN":
                 register_event(world, "threat", actor=env["from"], target=env.get("target"),
@@ -678,16 +684,15 @@ def cmd_scene(actors, rest, scenario_folder, llm, config=None):
                     type_="accusation", reliability=accusation.get("weight", 0.15),
                 )
             if env.get("facts"):
-                _record_revelation_evidence(
+                delivered_ids.extend(_record_revelation_evidence(
                     world, env, [actor.name for actor in actors.values()], recorded_revelations,
                     direct_reliability=direct_reliability,
                     relayed_reliability=relayed_reliability,
-                )
+                ))
 
-        if initiator is investigator and (answer_envelope.get("facts") or answer_envelope.get("accusations")):
-            _update_beliefs_from_evidence(
-                investigator, world, respondent.name, processed_evidence, delta=evidence_delta,
-            )
+        _update_beliefs_from_evidence(
+            investigator, world, delivered_ids, processed_evidence, delta=evidence_delta,
+        )
 
         if victory:
             return True

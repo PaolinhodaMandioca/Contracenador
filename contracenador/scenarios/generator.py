@@ -115,6 +115,7 @@ def build_code_fallback_scene(theme, drawn_names):
                 "greed": 0.28,
             },
             "saw": f"Vi {names[0]} agir de forma suspeita perto do evento central.",
+            "saw_effect": "supports",
         })
     return {
         "scene": world_seed["conflict"],

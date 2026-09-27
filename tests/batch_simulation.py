@@ -22,8 +22,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from contracenador.agents.agent import Actor, DEFAULT_TRAITS, create_actor
+from contracenador.cli.main import _record_revelation_evidence, _update_beliefs_from_evidence
 from contracenador.simulation import SimulationEngine
-from contracenador.world import (evidence_by_origin, open_world, position, register_evidence,
+from contracenador.world import (open_world, position, register_evidence,
                                  register_event, register_location)
 
 
@@ -72,9 +73,10 @@ def build_scene(tmp, seed):
     guilty_traits = _traits_around({"honesty": 0.2, "deceit": 0.8, "empathy": 0.3,
                                     "courage": 0.6, "aggressiveness": 0.5, "greed": 0.7})
     joao = _create_actor(actors_folder, "Joao", guilty_traits)
-    memory_id = joao.remember(truth, sensitivity=0.9, shareable=1)
+    goal = joao.form_goal("Não ser descoberto", priority=0.9, risk=0.9)
+    memory_id = joao.remember(truth, origin="system", sensitivity=0.9, shareable=1,
+                              about="Joao", effect="supports", protected_by_goal=goal["id"])
     joao.set_false_version(memory_id, "Joao estava no jardim o tempo todo.")
-    joao.form_goal("Não ser descoberto", priority=0.9, risk=0.9)
     position(world, "Joao", "cena", role="guilty")
     crime_event_id, _ = register_event(world, "crime", actor="Joao", location="cena",
                                        data={"proposition": truth}, public=False)
@@ -94,8 +96,9 @@ def build_scene(tmp, seed):
         actor = _create_actor(actors_folder, name, traits)
         position(world, name, "cena", role="witness")
         if saw:
-            actor.remember(saw, origin="observation", sensitivity=0.6, shareable=1, about="Joao")
-            register_evidence(world, crime_event_id, saw, origin=name, subject="Joao")
+            actor.remember(saw, origin="observation", sensitivity=0.6, shareable=1,
+                           about="Joao", effect="supports")
+            register_evidence(world, crime_event_id, saw, origin=name, subject="Joao", effect="supports")
         witnesses.append(actor)
 
     # Registro de presença (ver cmd_scene em main.py): todo mundo "conhece" todo mundo, o que
@@ -113,9 +116,13 @@ def simulate_one_scene(seed, max_rounds):
     """Reproduz o núcleo de decisão de `/cena` sem terminal. Devolve um dict com o desfecho."""
     random.seed(seed)
     tmp = tempfile.mkdtemp(prefix="contracenador_lote_")
+    opened_actors, world = [], None
     try:
         joao, ana, witnesses, world, truth = build_scene(tmp, seed)
         suspects = witnesses + [joao]
+        opened_actors = [ana] + suspects
+        topic = "Descobrir quem pegou a joia"
+        recorded, processed = set(), set()
         for s in suspects:
             ana.new_conversation(s.name)
             s.new_conversation(ana.name)
@@ -124,7 +131,7 @@ def simulate_one_scene(seed, max_rounds):
         lies, winner, rounds_used = 0, "guilty_escaped", max_rounds
 
         def select_investigation_pair(available_agents, turn_number, history):
-            target_name = ana.choose_investigation_target([s.name for s in suspects], truth, llm)
+            target_name = ana.choose_investigation_target([s.name for s in suspects], topic, llm)
             target = next(s for s in suspects if s.name == target_name)
             return ana, target
 
@@ -133,13 +140,10 @@ def simulate_one_scene(seed, max_rounds):
             if respondent is joao:
                 lies += sum(1 for fact in answer.get("facts", []) if fact["text"] != truth)
 
-            for evidence in evidence_by_origin(world, respondent.name):
-                if evidence["subject"] and evidence["subject"] != ana.name:
-                    ana.update_belief(
-                        f"{evidence['subject']} é o culpado", delta=0.2,
-                        origin=respondent.name, subject=evidence["subject"],
-                        evidence=f"evidence:{evidence['id']}",
-                    )
+            for envelope in (_question, answer):
+                ids = _record_revelation_evidence(
+                    world, envelope, [actor.name for actor in opened_actors], recorded)
+                _update_beliefs_from_evidence(ana, world, ids, processed)
             return False
 
         def check_outcome(turn_result):
@@ -157,7 +161,7 @@ def simulate_one_scene(seed, max_rounds):
 
         engine = SimulationEngine([ana] + suspects, select_investigation_pair)
         engine.run(
-            truth,
+            topic,
             llm,
             max_turns=max_rounds,
             on_exchange=process_exchange,
@@ -167,6 +171,10 @@ def simulate_one_scene(seed, max_rounds):
         return {"winner": winner, "rounds": rounds_used, "lies": lies,
                 "contradictions": len(ana.contradictions())}
     finally:
+        for actor in opened_actors:
+            actor.db.close()
+        if world is not None:
+            world.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
 

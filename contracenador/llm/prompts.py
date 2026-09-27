@@ -11,6 +11,9 @@ Regras estruturais obrigatórias:
 2. Coerência lógica absoluta: o álibi do culpado não pode contradizer o que as testemunhas viram, mas deve permitir brechas para dedução e pressão psicológica.
 3. Traços numéricos entre 0.0 e 1.0 para honesty, deceit, empathy, courage, aggressiveness e greed, ajustados ao papel.
 4. Cada personagem deve ter exemplos de fala que demonstrem seu estilo, vocabulário e temperamento.
+5. Cada testemunha deve ter 'saw_effect': 'supports' se a observação descrita em 'saw' apoia a suspeita,
+   'refutes' se oferece um álibi ou contraprova, ou 'neutral' se não altera a hipótese de culpa.
+   Classifique pelo conteúdo observado, não por saber quem é o culpado. Use 'neutral' quando 'saw' for null.
 
 A resposta deve ser EXCLUSIVAMENTE um objeto JSON válido, sem texto ou explicações antes ou depois.
 """

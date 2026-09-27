@@ -94,24 +94,27 @@ def materialize_scene(scene_data, actors_folder="atores", scenario_folder="cenar
 
         if role == "guilty":
             truth = character["truth"]
-            memory_id = actor.remember(truth, origin="system", sensitivity=0.9, shareable=1)
+            goal = actor.form_goal("Não ser descoberto", priority=0.9, risk=0.9)
+            memory_id = actor.remember(truth, origin="system", sensitivity=0.9, shareable=1,
+                                       about=name, effect="supports", protected_by_goal=goal["id"])
             actor.set_false_version(memory_id, character["alibi"])
-            actor.form_goal("Não ser descoberto", priority=0.9, risk=0.9)
             print(f"   [Culpado] {name}: gravada a verdade (memória #{memory_id}) e o álibi pré-gerado.")
         elif role == "investigator" and character.get("goal"):
             goal = character["goal"]
-            memory_id = actor.remember(f"Objetivo da investigação: {goal}",
-                                       origin="system", sensitivity=0.2, shareable=1)
             actor.form_goal(goal, priority=0.9)
-            print(f"   [Investigador] {name}: objetivo definido (memória #{memory_id}).")
+            actor.remember(f"Incidente informado: {scene_data['scene']}", origin="system",
+                           kind="context")
+            print(f"   [Investigador] {name}: objetivo definido e contexto público registrado.")
         elif role == "witness":
             saw = character.get("saw")
             if saw:
                 memory_id = actor.remember(saw, origin="observation", sensitivity=0.6,
-                                           shareable=1, about=guilty_name)
+                                           shareable=1, about=guilty_name,
+                                           effect=character.get("saw_effect", "neutral"))
                 print(f"   [Testemunha] {name}: gravado fato observado sobre {guilty_name} (memória #{memory_id}).")
                 if crime_event_id is not None:
-                    register_evidence(world, crime_event_id, saw, origin=name, subject=guilty_name)
+                    register_evidence(world, crime_event_id, saw, origin=name, subject=guilty_name,
+                                      effect=character.get("saw_effect", "neutral"))
             else:
                 print(f"   [Testemunha] {name}: não presenciou nada relevante (sem memórias iniciais).")
 

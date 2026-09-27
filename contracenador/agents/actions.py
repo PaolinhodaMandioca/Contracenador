@@ -2,8 +2,9 @@
 import math
 import random
 
-STANCE_PERSISTENCE = 3
 INTERROGATION_FATIGUE = 0.12
+DISCLOSURE_COST = 4.0
+STANCE_CHANGE = 0.5
 
 
 def sigmoid(value):
@@ -18,6 +19,11 @@ def choose_scapegoat(agent, other):
 
 
 def choose_action(agent, fact, other):
+    """Segredo ligado a objetivo exige benefício maior que custo, sem sorteio de confissão.
+
+    Outros fatos mantêm a política probabilística, mas só são reconsiderados se o
+    contexto mudar de forma relevante; insistência não expira uma postura.
+    """
     traits = agent.personality["traits"]
     relation = agent.relationship(other)
     guilt = agent.state("guilt")
@@ -30,17 +36,33 @@ def choose_action(agent, fact, other):
         - 2.5 * fact["sensitivity"]
         - relation["distrust"]
     )
-    reveal_chance = sigmoid(wants_to_reveal)
+    protected_goal = None
+    if fact.get("protected_by_goal") is not None:
+        protected_goal = agent.db.execute(
+            "SELECT * FROM goals WHERE id=? AND status='active'",
+            (fact["protected_by_goal"],)).fetchone()
+    if protected_goal:
+        wants_to_reveal -= (
+            DISCLOSURE_COST * protected_goal["priority"] * protected_goal["risk"]
+            + traits["deceit"]
+        )
+        reveal_chance = float(wants_to_reveal > 0)
+    else:
+        reveal_chance = sigmoid(wants_to_reveal)
 
     key = (other, fact["id"])
+    context = (tuple(sorted(traits.items())), fact["false_version"],
+               tuple(protected_goal) if protected_goal else None)
     previous = agent.stances.get(key)
     if previous:
-        previous_decision, previous_score, previous_extra, attempts = previous
-        if abs(wants_to_reveal - previous_score) < 0.5 and attempts < STANCE_PERSISTENCE:
-            agent.stances[key] = (previous_decision, previous_score, previous_extra, attempts + 1)
+        previous_decision, previous_score, previous_extra, previous_context = previous
+        crossed_threshold = protected_goal and ((wants_to_reveal > 0) != (previous_score > 0))
+        if (context == previous_context and not crossed_threshold
+                and abs(wants_to_reveal - previous_score) < STANCE_CHANGE):
             return previous_decision, previous_extra, reveal_chance
 
-    if random.random() < reveal_chance:
+    reveal = (wants_to_reveal > 0) if protected_goal else (random.random() < reveal_chance)
+    if reveal:
         decision, extra = "REVEAL", None
     else:
         goal = agent.main_goal()
@@ -59,7 +81,7 @@ def choose_action(agent, fact, other):
                 decision, extra = "LIE", None
             else:
                 decision, extra = "HIDE", None
-    agent.stances[key] = (decision, wants_to_reveal, extra, 0)
+    agent.stances[key] = (decision, wants_to_reveal, extra, context)
     return decision, extra, reveal_chance
 
 

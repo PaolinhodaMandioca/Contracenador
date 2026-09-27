@@ -8,6 +8,15 @@ esconde, mente ou ameaça é o **código** (não o modelo); o LLM só escreve a 
 Veja a visão completa e o roadmap do projeto em
 [`docs/Contracenador_Roadmap.md`](docs/Contracenador_Roadmap.md).
 
+Para a próxima sequência de implementação, veja o
+[`roadmap do motor de mundo e roteirista`](docs/Roadmap_Motor_de_Mundo.md),
+com diagnóstico do resultado atual, prioridades e critérios de conclusão para locais,
+objetos escondidos, pistas, encontros e conhecimento individual dos atores.
+
+A [pesquisa de melhorias e novas visões](docs/Pesquisa_e_Novas_Visoes.md) complementa
+esse plano com referências, novos achados e experimentos para investigação,
+cooperação, negociação e exploração de versões de uma história.
+
 ## Arquivos
 
 | Arquivo | Papel |
@@ -198,8 +207,15 @@ forneceu, e sobre quem). É separado da memória de cada Ator — verdade ≠ co
 Cada Ator também tem uma tabela de **crenças** (`contracenador/agents/agent.py`): uma proposição com um nível de
 confiança que evidências vão ajustando (`update_belief`). É o mesmo mecanismo tanto para crença
 social quanto para hipótese de investigação — o investigador de `/cena` forma e reforça a hipótese
-`"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
+`"<suspeito> é o culpado"` somente a partir dos relatos entregues a ele, e pode vencer por
 **dedução** (confiança ≥ 75%) mesmo sem uma confissão. Veja com `/painel` (seção "HIPÓTESES").
+
+Os relatos têm um efeito explícito sobre a hipótese: `supports` aumenta a suspeita,
+`refutes` a reduz e `neutral` não altera a crença. O campo `saw_effect` do roteiro define
+essa classificação para observações iniciais. A confiabilidade pondera o efeito; uma
+mentira ainda pode convencer quem a recebe. Relatos repetidos da mesma origem não
+acumulam reforço, e uma conversa privada não libera os outros testemunhos daquela pessoa.
+Informações legadas sem classificação são tratadas como neutras.
 
 ## Nomes dos personagens vêm de um banco, não da criatividade do LLM
 
@@ -226,6 +242,21 @@ inexistente - a mesma filosofia de "LLM propõe, código decide" usada no resto 
 Além de traços fixos, cada Ator pode ter **objetivos** estruturados (prioridade, progresso, risco,
 status) - não é só uma memória de texto. O Roteirista já dá ao investigador o objetivo dele e ao
 culpado o objetivo "Não ser descoberto".
+
+Objetivos orientam a atuação e ficam fora dos fatos compartilháveis. O investigador recebe
+o incidente como contexto inicial, sem precisar esconder ou revelar o próprio objetivo.
+A memória do crime fica vinculada ao objetivo do culpado por `protected_by_goal`.
+Enquanto esse objetivo está ativo, confessar exige que confiança, culpa e pressão superem
+sensibilidade, disposição para enganar e o custo `4 × prioridade × risco`. Essa decisão
+é determinística; repetir perguntas não sorteia uma confissão. Mudanças relevantes na
+relação ou no objetivo permitem reconsiderá-la. Repetir o mesmo álibi ao mesmo interlocutor
+não soma culpa novamente.
+
+As colunas novas são migradas ao abrir os bancos. Objetivos e segredos reconhecíveis no
+formato do materializador anterior são ajustados sem apagar memórias. Crenças incorretas
+já acumuladas em saves antigos não são revertidas automaticamente: falta proveniência
+suficiente para reconstruí-las com segurança. Para comparar os comportamentos, use uma
+cena nova. Os pesos da confissão ainda precisam de calibração com diálogos do modelo real.
 
 A antiga decisão REVEAL/HIDE/LIE (`choose_action()` em `contracenador/agents/agent.py`) ganhou uma quarta opção,
 **DEFLECT**: quando um objetivo ativo de alta prioridade justifica o risco (e a personalidade

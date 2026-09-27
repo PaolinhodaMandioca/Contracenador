@@ -31,7 +31,8 @@ from ..memory.embeddings import (
 )
 from ..memory.sqlite import connect_database
 from . import actions as action_policy
-from .actions import INTERROGATION_FATIGUE, STANCE_PERSISTENCE, sigmoid
+from .actions import INTERROGATION_FATIGUE, sigmoid
+from ..world.evidence import EVIDENCE_EFFECTS
 
 # ============================================================================
 # 1) CONFIGURAÇÕES GERAIS
@@ -63,7 +64,7 @@ PRAGMA synchronous = NORMAL;
 # (para migrar arquivos antigos no futuro sem precisar de outra extensão).
 MARK = """
 PRAGMA application_id = 1095192148;  -- 0x41474E54 = "AGNT"
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 """
 
 TABLES = """
@@ -84,6 +85,9 @@ CREATE TABLE IF NOT EXISTS memories (
                                              -- contradição em receive()
     contradictory  INTEGER DEFAULT 0,       -- 1 = essa memória entrou em conflito com outra já
                                              -- registrada da mesma origem sobre o mesmo source_id
+    kind           TEXT DEFAULT 'fact',     -- 'fact' | 'goal' | 'context'
+    effect         TEXT DEFAULT 'neutral',  -- efeito sobre a hipótese de culpa de about
+    protected_by_goal INTEGER,              -- objetivo que seria prejudicado pela revelação
     embedding      BLOB                     -- vetor de embedding (calculado sob demanda na 1ª
                                              -- busca semântica, ver recall_semantic); NULL até lá,
                                              -- e sempre NULL se o servidor não suportar
@@ -130,6 +134,14 @@ CREATE TABLE IF NOT EXISTS beliefs (
     evidence      TEXT DEFAULT '[]',      -- JSON: lista de referências soltas (ex.: ids de world.py)
     created_at    REAL,
     updated_at    REAL
+);
+
+-- Repetir a mesma mentira não cria culpa adicional a cada turno ou reinício.
+CREATE TABLE IF NOT EXISTS deceptions (
+    memory_id INTEGER,
+    recipient TEXT,
+    content TEXT,
+    PRIMARY KEY (memory_id, recipient, content)
 );
 """
 
@@ -218,6 +230,26 @@ def _migrate(db):
     if "embedding" not in columns:
         db.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
         db.commit()
+    for name, declaration in (
+        ("kind", "TEXT DEFAULT 'fact'"),
+        ("effect", "TEXT DEFAULT 'neutral'"),
+        ("protected_by_goal", "INTEGER"),
+    ):
+        if name not in columns:
+            db.execute(f"ALTER TABLE memories ADD COLUMN {name} {declaration}")
+    if db.execute("PRAGMA user_version").fetchone()[0] < 3:
+        # Reconhece apenas o formato exato produzido pelo materializador legado.
+        db.execute(
+            "UPDATE memories SET kind='goal', shareable=0 WHERE origin='system' "
+            "AND text IN (SELECT 'Objetivo da investigação: ' || description FROM goals)")
+        db.execute(
+            "UPDATE memories SET protected_by_goal=(SELECT id FROM goals "
+            "WHERE description='Não ser descoberto'), effect='supports' "
+            "WHERE origin='system' AND false_version IS NOT NULL AND sensitivity>=0.7 "
+            "AND protected_by_goal IS NULL AND EXISTS "
+            "(SELECT 1 FROM goals WHERE description='Não ser descoberto')")
+    db.execute("PRAGMA user_version = 3")
+    db.commit()
 
     state_columns = {row["name"] for row in db.execute("PRAGMA table_info(state)")}
     if "key" not in state_columns and "chave" in state_columns:
@@ -440,7 +472,7 @@ class Actor:
         # Coisas que vivem só na RAM (somem quando o programa fecha):
         self.history = {}         # conversa recente com cada interlocutor
         self.disclosed = set()    # (interlocutor, id_da_memoria) que já foram revelados de verdade
-        self.stances = {}         # (interlocutor, id_da_memoria) -> (decisão, placar, extra, tentativas)
+        self.stances = {}         # postura mantida enquanto o contexto relevante não mudar
         self.satisfied = set()    # interlocutores de quem já consegui a informação que queria
         self.waiting = False      # True se o último passo foi pedir algo e a resposta ainda não veio
         self.verbose = True       # imprime no terminal as decisões internas (bom para ajustar pesos)
@@ -465,21 +497,26 @@ class Actor:
     # ------------------------------------------------------------------
 
     def remember(self, text, origin="user", sensitivity=0.3, shareable=1, about=None,
-                 source_id=None):
+                 source_id=None, kind="fact", effect="neutral", protected_by_goal=None):
         """
         Salva um fato. Gravar é só um INSERT (não reescreve o arquivo inteiro).
         `about` é o nome de quem é o assunto do fato (ex.: outro ator) - ver knows_about().
         `source_id` é o id da memória ORIGINAL na cabeça de quem contou (mesmo fato-base) -
         permite notar quando a mesma origem muda de versão sobre a mesma coisa, ver receive().
         """
+        if kind not in {"fact", "goal", "context"} or effect not in EVIDENCE_EFFECTS:
+            raise ValueError("Tipo de memória ou efeito de evidência inválido")
+        if kind != "fact":
+            shareable = 0
         text = text.strip()
         existing = self.db.execute("SELECT id FROM memories WHERE text=?", (text,)).fetchone()
         if existing:  # não duplica o mesmo fato
             return existing["id"]
         cursor = self.db.execute(
-            "INSERT INTO memories(text, timestamp, origin, shareable, sensitivity, about, source_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (text, time.time(), origin, shareable, sensitivity, about, source_id))
+            "INSERT INTO memories(text, timestamp, origin, shareable, sensitivity, about, source_id, "
+            "kind, effect, protected_by_goal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (text, time.time(), origin, shareable, sensitivity, about, source_id,
+             kind, effect, protected_by_goal))
         self.db.commit()
         return cursor.lastrowid
 
@@ -502,7 +539,7 @@ class Actor:
         Busca por PALAVRA: não pega paráfrase (ver recall_semantic para isso).
         """
         wanted = words(query)
-        sql = "SELECT * FROM memories" + (" WHERE shareable=1" if shareable_only else "")
+        sql = "SELECT * FROM memories" + (" WHERE shareable=1 AND kind='fact'" if shareable_only else "")
         candidates = []
         for memory in self.db.execute(sql):
             score = len(wanted & words(memory["text"]))
@@ -525,7 +562,7 @@ class Actor:
         com --embeddings). Quem chama decide o que fazer - ver `_recall_best`, que cai para
         `recall()` nesse caso; esta função em si NUNCA cai sozinha para a busca lexical.
         """
-        sql = "SELECT * FROM memories" + (" WHERE shareable=1" if shareable_only else "")
+        sql = "SELECT * FROM memories" + (" WHERE shareable=1 AND kind='fact'" if shareable_only else "")
         candidates = [dict(m) for m in self.db.execute(sql)]
         if not candidates:
             return []
@@ -603,7 +640,8 @@ class Actor:
         que o Ator já sabe sobre a própria pessoa à sua frente.
         """
         rows = self.db.execute(
-            "SELECT * FROM memories WHERE shareable=1 AND about=? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM memories WHERE shareable=1 AND kind='fact' "
+            "AND protected_by_goal IS NULL AND about=? ORDER BY id DESC LIMIT ?",
             (who, k))
         return [dict(m) for m in rows]
 
@@ -849,6 +887,12 @@ class Actor:
     def _messages(self, interlocutor, final_text):
         """Monta: [personalidade fixa] + [histórico curto] + [mensagem final variável]."""
         history = self.history.setdefault(interlocutor, [])
+        goals = self.active_goals()
+        context = [row["text"] for row in self.db.execute(
+            "SELECT text FROM memories WHERE kind='context' ORDER BY id DESC LIMIT 3")]
+        if goals or context:
+            final_text += "\nContexto de atuação (objetivos não são pistas a revelar ou esconder):\n"
+            final_text += "\n".join([f"Objetivo: {goal['description']}" for goal in goals] + context)
         return ([{"role": "system", "content": self.system_prompt()}]
                 + history
                 + [{"role": "user", "content": final_text}])
@@ -967,6 +1011,9 @@ class Actor:
         other = env["from"]
         target = env.get("target")
         i_am_target = (target is None or target == self.name)
+        if not i_am_target:
+            # Envelopes de conversa são privados; percepção pública é responsabilidade do mundo.
+            return
 
         # (a) Ameaça:
         # Se eu sou o alvo da ameaça: o medo sobe, confiança cai e desconfiança sobe.
@@ -987,6 +1034,7 @@ class Actor:
         #     confiança e eu passo a dever um favor.
         for fact in env.get("facts", []):
             text, source_id = fact["text"], fact.get("source_id")
+            is_new = self.memory_id_by_text(text) is None
             previous = None
             if source_id is not None:
                 previous = self.db.execute(
@@ -996,16 +1044,17 @@ class Actor:
             memory_id = self.remember(
                 text, origin=other, sensitivity=0.5, source_id=source_id,
                 about=fact.get("subject"),
+                effect=fact.get("effect", "neutral"),
             )
 
-            if previous is not None:
+            if previous is not None and is_new:
                 self.db.execute("UPDATE memories SET contradictory=1 WHERE id IN (?, ?)",
                                 (previous["id"], memory_id))
                 self.db.commit()
                 self.change_relationship(other, distrust=0.3, trust=-0.2)
                 self._log(f"{self.name} pegou {other} se contradizendo: antes disse "
                           f"{previous['text']!r}, agora diz {text!r}")
-            else:
+            elif is_new:
                 self.change_relationship(other, trust=0.05, favor_owed=0.1)
                 self._log(f"{self.name} aprendeu com {other}: {text!r}")
 
@@ -1061,7 +1110,8 @@ class Actor:
         #    decidido duas vezes no mesmo turno - uma vez pela minha verdade, outra pela
         #    fofoca ecoada - e sair uma fala confessando e mentindo ao mesmo tempo.
         relevant = self._recall_best(f"{env['text']} {topic}", llm, k=4, shareable_only=True)
-        about_others = [m for m in relevant if m["about"] not in (other, self.name)]
+        about_others = [m for m in relevant if m["about"] not in (other, self.name)
+                        or m["protected_by_goal"] is not None]
         pending = [m for m in about_others
                    if (other, m["id"]) not in self.disclosed and m["origin"] != other][:2]
 
@@ -1075,6 +1125,7 @@ class Actor:
             if decision == "REVEAL":
                 outgoing_facts.append({"text": fact["text"], "source_id": fact["id"],
                                        "origin": fact["origin"], "subject": fact["about"],
+                                       "effect": fact["effect"],
                                        "kind": "REVEAL"})
                 self.disclosed.add((other, fact["id"]))
             elif decision == "LIE":
@@ -1083,14 +1134,15 @@ class Actor:
                 # ele depois, quem ouviu as duas versões pega a contradição (ver receive()).
                 outgoing_facts.append({"text": fact["false_version"], "source_id": fact["id"],
                                        "origin": fact["origin"], "subject": fact["about"],
+                                       "effect": "refutes" if fact["protected_by_goal"] is not None else "neutral",
                                        "kind": "LIE"})
-                self.change_state("guilt", 0.1 + 0.4 * self.personality["traits"]["empathy"])  # empatia = mais culpa
             elif decision == "DEFLECT":
                 fake_target = extra["fake_target"]
                 accusations.append({"subject": fake_target,
                                     "proposition": f"{fake_target} pode estar envolvido nisso.",
                                     "weight": 0.15})
-                self.change_state("guilt", 0.05 + 0.3 * self.personality["traits"]["empathy"])
+                self._record_deception(fact["id"], other, accusations[-1]["proposition"],
+                                       0.05 + 0.3 * self.personality["traits"]["empathy"])
                 self._log(f"{self.name} desviou a suspeita para {fake_target}")
             else:
                 hid = True
@@ -1171,6 +1223,9 @@ class Actor:
             self._log(f"{self.name} decidiu {fact['kind']} mas não conseguiu verbalizar - "
                      f"fato descartado deste turno: {fact['text']!r}")
         for fact in outgoing_facts:
+            if fact["kind"] == "LIE":
+                self._record_deception(fact["source_id"], other, fact["text"],
+                                       0.1 + 0.4 * self.personality["traits"]["empathy"])
             del fact["kind"]
 
         self._save_history(other, heard, response)
@@ -1186,6 +1241,14 @@ class Actor:
 
         return {"from": self.name, "target": other, "tactic": tactic, "text": response,
                 "facts": outgoing_facts, "accusations": accusations}
+
+    def _record_deception(self, memory_id, other, content, guilt_delta):
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO deceptions(memory_id, recipient, content) VALUES (?, ?, ?)",
+            (memory_id, other, content))
+        self.db.commit()
+        if cursor.rowcount:
+            self.change_state("guilt", guilt_delta)
 
     # ------------------------------------------------------------------
     # 4.8) PAINEL DE DEBUG (modo /debug): tudo que o código já calculou,
