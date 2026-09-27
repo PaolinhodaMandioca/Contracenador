@@ -75,6 +75,53 @@ class LLM:
                 f"Não consegui falar com o llama-server em {self.url}. Ele está rodando? ({erro})"
             )
 
+    def embedding(self, texto):
+        """
+        Pede ao llama-server o vetor de embedding de `texto`, usando o MESMO servidor/modelo já
+        carregado para falar - sem modelo nem dependência extra (roadmap, seção 8: memória
+        semântica). Requer o servidor iniciado com --embedding (ver GerenciadorServidor em
+        main.py); levanta RuntimeError se o endpoint não existir ou o servidor não responder -
+        quem chama decide o que fazer (ver Ator.recordar_semantico, que cai para a busca
+        lexical de sempre nesse caso).
+
+        Tenta primeiro o endpoint compatível com OpenAI (/v1/embeddings, formato estável entre
+        versões do llama.cpp); se o servidor não tiver essa rota, cai para o endpoint nativo
+        (/embedding), cujo formato já mudou entre versões (às vezes devolve o vetor direto,
+        às vezes uma lista de resultados, às vezes um vetor por "pooling") - por isso o
+        tratamento defensivo abaixo.
+        """
+        try:
+            dados = self._pedir("/v1/embeddings", {"input": texto})
+            return dados["data"][0]["embedding"]
+        except RuntimeError:
+            pass  # servidor sem rota OpenAI-compatível; tenta a nativa
+
+        dados = self._pedir("/embedding", {"content": texto})
+        if isinstance(dados, list):  # algumas versões devolvem uma lista de resultados
+            dados = dados[0]
+        vetor = dados["embedding"]
+        if vetor and isinstance(vetor[0], list):  # ou uma lista de vetores (um por pooling)
+            vetor = vetor[0]
+        return vetor
+
+    def _pedir(self, caminho, corpo):
+        """POST genérico ao llama-server, para endpoints que não precisam de streaming."""
+        pedido = urllib.request.Request(
+            self.url + caminho,
+            data=json.dumps(corpo).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(pedido, timeout=self.timeout) as resposta:
+                return json.load(resposta)
+        except urllib.error.HTTPError as erro:
+            detalhe = erro.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"O llama-server respondeu com erro {erro.code}: {detalhe}")
+        except OSError as erro:
+            raise RuntimeError(
+                f"Não consegui falar com o llama-server em {self.url}. Ele está rodando? ({erro})"
+            )
+
     def _ler_stream(self, resposta):
         """Lê a resposta em streaming (SSE): linhas 'data: {json}' até 'data: [DONE]'."""
         partes = []

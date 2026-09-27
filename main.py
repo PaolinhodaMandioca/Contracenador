@@ -52,13 +52,14 @@ class GerenciadorServidor:
     MODELO_ATORES      = "Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M"
     MODELO_ROTEIRISTA  = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
 
-    def __init__(self, modelo, porta, slots=2, contexto=4096, threads=None):
-        self.modelo   = modelo
-        self.porta    = porta
-        self.slots    = slots
-        self.contexto = contexto
-        self.threads  = threads   # None = llama-server decide sozinho
-        self._proc    = None
+    def __init__(self, modelo, porta, slots=2, contexto=4096, threads=None, embedding=False):
+        self.modelo    = modelo
+        self.porta     = porta
+        self.slots     = slots
+        self.contexto  = contexto
+        self.threads   = threads   # None = llama-server decide sozinho
+        self.embedding = embedding  # liga o endpoint de embedding (memória semântica, Ator.py)
+        self._proc     = None
 
     # ------------------------------------------------------------------
     # API pública
@@ -124,6 +125,8 @@ class GerenciadorServidor:
         )
         if self.threads:
             cmd += ["-t", str(self.threads)]
+        if self.embedding:
+            cmd += ["--embedding"]
         return cmd
 
     def _aguardar_pronto(self, tentativas=120, intervalo=2.0):
@@ -665,6 +668,8 @@ def main():
         slots=args.slots,
         contexto=4096,
         threads=args.threads,
+        embedding=True,  # memória semântica (Ator.recordar_semantico); se a build do
+                         # llama.cpp não suportar, o Ator cai sozinho pra busca lexical
     )
     srv_roteirista = GerenciadorServidor(
         modelo=args.modelo_roteirista,

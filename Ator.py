@@ -15,6 +15,7 @@ concreta e escreve a fala. Vantagens:
   * a verdade nem entra no prompt quando o agente vai esconder ou mentir,
     então o modelo de 3B não tem como "vazar" o que não recebeu.
 """
+import array
 import json
 import math
 import random
@@ -75,8 +76,11 @@ CREATE TABLE IF NOT EXISTS memorias (
                                              -- na cabeça de quem contou); permite notar quando ela
                                              -- muda de versão sobre a MESMA coisa - ver detectar
                                              -- contradição em receber()
-    contraditoria  INTEGER DEFAULT 0        -- 1 = essa memória entrou em conflito com outra já
+    contraditoria  INTEGER DEFAULT 0,       -- 1 = essa memória entrou em conflito com outra já
                                              -- registrada da mesma origem sobre o mesmo origem_id
+    embedding      BLOB                     -- vetor de embedding (calculado sob demanda na 1ª
+                                             -- busca semântica, ver recordar_semantico); NULL
+                                             -- até lá, e sempre NULL se o servidor não suportar
 );
 
 CREATE TABLE IF NOT EXISTS estado (
@@ -149,6 +153,9 @@ def _migrar(db):
         db.commit()
     if "contraditoria" not in colunas:
         db.execute("ALTER TABLE memorias ADD COLUMN contraditoria INTEGER DEFAULT 0")
+        db.commit()
+    if "embedding" not in colunas:
+        db.execute("ALTER TABLE memorias ADD COLUMN embedding BLOB")
         db.commit()
 
 
@@ -238,6 +245,36 @@ def detectar_sujeito(texto, nomes):
 
 
 # ============================================================================
+# 3b) MEMÓRIA SEMÂNTICA: vetores de embedding (roadmap, seção 8)
+# ============================================================================
+# Guardados como BLOB (array de floats, sem depender de numpy) em vez de JSON: mais compacto
+# e sem custo de parsing de texto a cada leitura.
+
+def _serializar_vetor(vetor):
+    return array.array("f", vetor).tobytes()
+
+
+def _desserializar_vetor(blob):
+    vetor = array.array("f")
+    vetor.frombytes(blob)
+    return vetor.tolist()
+
+
+def _cosseno(a, b):
+    """Similaridade de cosseno entre dois vetores (1 = mesma direção, 0 = ortogonais). Puro
+    Python de propósito: os vetores são poucos por Ator, não vale a pena depender de numpy."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    produto = sum(a[i] * b[i] for i in range(n))
+    norma_a = math.sqrt(sum(x * x for x in a))
+    norma_b = math.sqrt(sum(x * x for x in b))
+    if norma_a == 0 or norma_b == 0:
+        return 0.0
+    return produto / (norma_a * norma_b)
+
+
+# ============================================================================
 # 4) O AGENTE
 # ============================================================================
 
@@ -262,6 +299,7 @@ class Agente:
         self.contagem_esquiva = {}  # interlocutor -> nº de vezes que desviei (roda táticas de evasão)
         self.debug = False       # modo debug: imprime o painel completo após cada resposta
         self.ultima_decisao = {} # interlocutor -> dados do último turno (para o painel de debug)
+        self._sem_embedding = False  # True assim que o servidor recusar embeddings 1x (ver _recordar_melhor)
 
     def _log(self, mensagem):
         if self.mostrar:
@@ -311,7 +349,7 @@ class Agente:
         isso que mantém o contexto curto (e o modelo pequeno).
         `so_compartilhaveis=True` é o FILTRO DE ISOLAMENTO: nas conversas com outros
         agentes, o que é privado nem é lido do banco, então não tem como vazar.
-        (Evolução futura: trocar por FTS5 ou embeddings pequenos + sqlite-vec.)
+        Busca por PALAVRA: não pega paráfrase (ver recordar_semantico para isso).
         """
         procuradas = palavras(consulta)
         sql = "SELECT * FROM memorias" + (" WHERE compartilhavel=1" if so_compartilhaveis else "")
@@ -322,6 +360,59 @@ class Agente:
                 candidatas.append((pontos, memoria["data"], dict(memoria)))
         candidatas.sort(key=lambda c: (c[0], c[1]), reverse=True)
         return [c[2] for c in candidatas[:k]]
+
+    def recordar_semantico(self, consulta, llm, k=3, so_compartilhaveis=False):
+        """
+        Como recordar(), mas por SIGNIFICADO em vez de palavra em comum: usa o embedding do
+        próprio LLM (LLM.embedding em llm.py) - o mesmo servidor de sempre, sem modelo nem
+        dependência extra (roadmap, seção 8). Pega paráfrases que recordar() não pegaria (ex.:
+        "perto do cofre" e "saindo do escritório" podem ficar próximos no espaço de embeddings
+        mesmo sem nenhuma palavra igual).
+
+        Embeddings de cada memória são calculados PREGUIÇOSAMENTE (só na primeira vez que ela
+        entra numa busca semântica) e ficam salvos no `.db` - buscas seguintes gastam UMA
+        chamada ao LLM (a da consulta), não uma por memória.
+
+        Levanta RuntimeError se o servidor não tiver o endpoint de embedding (não foi iniciado
+        com --embedding). Quem chama decide o que fazer - ver `_recordar_melhor`, que cai para
+        `recordar()` nesse caso; esta função em si NUNCA cai sozinha para a busca lexical.
+        """
+        sql = "SELECT * FROM memorias" + (" WHERE compartilhavel=1" if so_compartilhaveis else "")
+        candidatas = [dict(m) for m in self.db.execute(sql)]
+        if not candidatas:
+            return []
+
+        vetor_consulta = llm.embedding(consulta)
+
+        pontuadas = []
+        for memoria in candidatas:
+            if memoria["embedding"] is None:
+                vetor = llm.embedding(memoria["texto"])
+                self.db.execute("UPDATE memorias SET embedding=? WHERE id=?",
+                                (_serializar_vetor(vetor), memoria["id"]))
+                self.db.commit()
+            else:
+                vetor = _desserializar_vetor(memoria["embedding"])
+            similaridade = _cosseno(vetor_consulta, vetor)
+            pontuadas.append((similaridade, memoria["data"], memoria))
+
+        pontuadas.sort(key=lambda c: (c[0], c[1]), reverse=True)
+        return [c[2] for c in pontuadas[:k]]
+
+    def _recordar_melhor(self, consulta, llm, k=3, so_compartilhaveis=False):
+        """
+        Tenta memória semântica; se o servidor não suportar embeddings (não foi iniciado com
+        --embedding) ou der qualquer erro de rede, cai para a busca lexical de sempre - nunca
+        quebra uma conversa por causa disso. Uma vez que o servidor responde embeddings, fica
+        assim para o resto da sessão (não fica tentando de novo a cada turno).
+        """
+        if getattr(self, "_sem_embedding", False):
+            return self.recordar(consulta, k=k, so_compartilhaveis=so_compartilhaveis)
+        try:
+            return self.recordar_semantico(consulta, llm, k=k, so_compartilhaveis=so_compartilhaveis)
+        except RuntimeError:
+            self._sem_embedding = True
+            return self.recordar(consulta, k=k, so_compartilhaveis=so_compartilhaveis)
 
     def listar_memorias(self):
         return [dict(m) for m in self.db.execute("SELECT * FROM memorias ORDER BY id")]
@@ -742,7 +833,7 @@ class Agente:
     # ------------------------------------------------------------------
 
     def falar_com_usuario(self, texto, llm):
-        lembrancas = self.recordar(texto, k=3)  # inclui memórias privadas
+        lembrancas = self._recordar_melhor(texto, llm, k=3)  # inclui memórias privadas
         bloco = ""
         if lembrancas:
             bloco = ("Coisas que você sabe e podem ajudar:\n"
@@ -883,7 +974,7 @@ class Agente:
         #    própria versão falsa). Sem essa exclusão, o mesmo fato "sobre mim" podia ser
         #    decidido duas vezes no mesmo turno - uma vez pela minha verdade, outra pela
         #    fofoca ecoada - e sair uma fala confessando e mentindo ao mesmo tempo.
-        relevantes = self.recordar(f"{env['texto']} {topico}", k=4, so_compartilhaveis=True)
+        relevantes = self._recordar_melhor(f"{env['texto']} {topico}", llm, k=4, so_compartilhaveis=True)
         sobre_terceiros = [m for m in relevantes if m["sobre"] not in (outro, self.nome)]
         pendentes = [m for m in sobre_terceiros
                      if (outro, m["id"]) not in self.contados and m["origem"] != outro][:2]

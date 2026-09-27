@@ -12,7 +12,7 @@ Veja a visão completa e o roadmap do projeto em
 
 | Arquivo | Papel |
 |---|---|
-| `llm.py` | Cliente do llama-server (só biblioteca padrão, com streaming no terminal) |
+| `llm.py` | Cliente do llama-server (só biblioteca padrão): fala, gera cena e embeddings |
 | `Ator.py` | Cérebro do Ator: banco, memória, crenças, emoções, decisões, prompts |
 | `mundo.py` | O WorldState: locais, personagens, eventos e evidências (a verdade objetiva da cena) |
 | `nomes.py` | Banco de nomes prontos; o código sorteia, o Roteirista só usa (não inventa nomes) |
@@ -176,10 +176,24 @@ mentiu e mais tarde, sob pressão, confessou), quem ouviu as duas versões perce
 perde confiança nela, a desconfiança sobe, e as duas memórias ficam marcadas — visível em
 `/painel` (seção "CONTRADIÇÕES PEGAS").
 
+## Memória semântica
+
+`recordar()` busca por palavra em comum (rápido, mas não pega paráfrase). `recordar_semantico()`
+usa o embedding do próprio LLM já carregado (`LLM.embedding` em `llm.py`, endpoint
+`/v1/embeddings` ou `/embedding` do llama-server) para achar memórias parecidas por
+**significado** - "perto do cofre" pode casar com "saindo do escritório" mesmo sem palavra
+igual. O embedding de cada memória é calculado uma única vez e fica salvo no `.db`; buscas
+seguintes só gastam uma chamada ao LLM (a da consulta).
+
+Isso exige o servidor iniciado com `--embedding` (o `main.py` já liga isso sozinho no servidor
+dos Atores). Se o servidor não suportar - build antiga, ou rodando sem a flag -, o Ator detecta
+o erro na primeira tentativa e volta a usar `recordar()` pelo resto da sessão, sem travar nada.
+
 ## Limitações conhecidas
 
-- Busca de memória por palavras em comum (sem embeddings): a pergunta precisa usar palavras
-  parecidas com as do fato.
+- Memória semântica (embeddings) só funciona se o llama-server tiver sido iniciado com
+  `--embedding` e a build suportar o endpoint; sem isso, a busca cai para palavra em comum
+  (a pergunta precisa usar palavras parecidas com as do fato).
 - Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções,
   relações e crenças ficam no `.db`.
 - Contradição só é detectada quando é a MESMA origem mudando de versão sobre o MESMO fato (ex.:
@@ -199,10 +213,12 @@ python -m unittest discover -s tests -v
 ```
 
 Testes determinísticos (`tests/test_ator.py`, `tests/test_mundo.py`, `tests/test_roteirista.py`,
-`tests/test_main.py`, `tests/test_nomes.py`): memória e isolamento, mentira não vaza a verdade, fofoca relatada em
-terceira pessoa (não primeira), DESVIAR exige objetivo + candidato, contradição, crenças,
-objetivos, decaimento de emoção, escolha autônoma de quem interrogar, WorldState, materialização
-de cena e reconhecimento de nomes com espaço em `/conversar`.
+`tests/test_main.py`, `tests/test_nomes.py`, `tests/test_memoria_semantica.py`): memória e
+isolamento, mentira não vaza a verdade, fofoca relatada em terceira pessoa (não primeira),
+DESVIAR exige objetivo + candidato, contradição, crenças, objetivos, decaimento de emoção,
+escolha autônoma de quem interrogar, WorldState, materialização de cena, reconhecimento de nomes
+com espaço em `/conversar` e memória semântica (similaridade de cosseno, cache de embedding,
+fallback para busca lexical).
 Nenhum chama um LLM de verdade (usam um `FakeLLM` em `tests/apoio.py`) - o que é testado é a
 lógica em CÓDIGO, não a qualidade do texto gerado.
 
