@@ -126,7 +126,7 @@ class GerenciadorServidor:
         if self.threads:
             cmd += ["-t", str(self.threads)]
         if self.embedding:
-            cmd += ["--embedding"]
+            cmd += ["--embeddings"]
         return cmd
 
     def _aguardar_pronto(self, tentativas=120, intervalo=2.0):

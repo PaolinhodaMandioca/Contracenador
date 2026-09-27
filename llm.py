@@ -79,7 +79,7 @@ class LLM:
         """
         Pede ao llama-server o vetor de embedding de `texto`, usando o MESMO servidor/modelo já
         carregado para falar - sem modelo nem dependência extra (roadmap, seção 8: memória
-        semântica). Requer o servidor iniciado com --embedding (ver GerenciadorServidor em
+        semântica). Requer o servidor iniciado com --embeddings (ver GerenciadorServidor em
         main.py); levanta RuntimeError se o endpoint não existir ou o servidor não responder -
         quem chama decide o que fazer (ver Ator.recordar_semantico, que cai para a busca
         lexical de sempre nesse caso).

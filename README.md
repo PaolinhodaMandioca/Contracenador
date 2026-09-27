@@ -185,14 +185,14 @@ usa o embedding do próprio LLM já carregado (`LLM.embedding` em `llm.py`, endp
 igual. O embedding de cada memória é calculado uma única vez e fica salvo no `.db`; buscas
 seguintes só gastam uma chamada ao LLM (a da consulta).
 
-Isso exige o servidor iniciado com `--embedding` (o `main.py` já liga isso sozinho no servidor
+Isso exige o servidor iniciado com `--embeddings` (o `main.py` já liga isso sozinho no servidor
 dos Atores). Se o servidor não suportar - build antiga, ou rodando sem a flag -, o Ator detecta
 o erro na primeira tentativa e volta a usar `recordar()` pelo resto da sessão, sem travar nada.
 
 ## Limitações conhecidas
 
 - Memória semântica (embeddings) só funciona se o llama-server tiver sido iniciado com
-  `--embedding` e a build suportar o endpoint; sem isso, a busca cai para palavra em comum
+  `--embeddings` e a build suportar o endpoint; sem isso, a busca cai para palavra em comum
   (a pergunta precisa usar palavras parecidas com as do fato).
 - Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções,
   relações e crenças ficam no `.db`.

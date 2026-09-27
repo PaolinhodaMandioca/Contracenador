@@ -91,7 +91,7 @@ class TestRecordarSemantico(TesteComAtores):
 
 class TestRecordarMelhorComFallback(TesteComAtores):
     """_recordar_melhor nunca pode quebrar uma conversa por causa de um servidor sem
-    --embedding - precisa cair para a busca lexical de sempre."""
+    --embeddings - precisa cair para a busca lexical de sempre."""
 
     def test_cai_para_busca_lexical_sem_suporte_a_embedding(self):
         joao = self.criar_ator("Joao")

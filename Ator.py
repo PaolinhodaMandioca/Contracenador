@@ -374,7 +374,7 @@ class Agente:
         chamada ao LLM (a da consulta), não uma por memória.
 
         Levanta RuntimeError se o servidor não tiver o endpoint de embedding (não foi iniciado
-        com --embedding). Quem chama decide o que fazer - ver `_recordar_melhor`, que cai para
+        com --embeddings). Quem chama decide o que fazer - ver `_recordar_melhor`, que cai para
         `recordar()` nesse caso; esta função em si NUNCA cai sozinha para a busca lexical.
         """
         sql = "SELECT * FROM memorias" + (" WHERE compartilhavel=1" if so_compartilhaveis else "")
@@ -402,7 +402,7 @@ class Agente:
     def _recordar_melhor(self, consulta, llm, k=3, so_compartilhaveis=False):
         """
         Tenta memória semântica; se o servidor não suportar embeddings (não foi iniciado com
-        --embedding) ou der qualquer erro de rede, cai para a busca lexical de sempre - nunca
+        --embeddings) ou der qualquer erro de rede, cai para a busca lexical de sempre - nunca
         quebra uma conversa por causa disso. Uma vez que o servidor responde embeddings, fica
         assim para o resto da sessão (não fica tentando de novo a cada turno).
         """

@@ -27,9 +27,9 @@ class FakeLLM:
         return self.resposta
 
     def embedding(self, texto):
-        # Simula um llama-server iniciado SEM --embedding: é exatamente o caso que
+        # Simula um llama-server iniciado SEM --embeddings: é exatamente o caso que
         # Ator._recordar_melhor precisa detectar e cair para a busca lexical (recordar()).
-        raise RuntimeError("FakeLLM não suporta embeddings (servidor de teste sem --embedding)")
+        raise RuntimeError("FakeLLM não suporta embeddings (servidor de teste sem --embeddings)")
 
 
 class TesteComAtores(unittest.TestCase):
