@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-from Ator import Ator, TRACOS_PADRAO, criar_ator, detectar_sujeito, limitar
+from Ator import Ator, TRACOS_PADRAO, criar_ator, detectar_sujeito, limitar, normalizar
 from llm import LLM
 from mundo import abrir_mundo, buscar_evento_tipo, evidencias_por_origem, registrar_evento
 from roteirista import gerar_cena_llm, materializar_cena
@@ -392,17 +392,34 @@ def cmd_novo(pasta, nome, atores, slots):
     print(f"   Ator {nome.capitalize()} criado em {caminho}.")
 
 
+def _consumir_nome_ator(texto, atores):
+    """
+    Tenta casar, no INÍCIO de `texto`, o nome de um ator conhecido - funciona tanto com nomes
+    de uma palavra ('Bia') quanto de várias ('Ana Carvalho', como o Roteirista sempre gera).
+    Testa do nome mais longo pro mais curto, pra 'Ana Carvalho' não parar em 'Ana' por engano.
+    Devolve (ator, resto do texto) ou (None, texto) se nada bateu.
+    """
+    texto = texto.strip()
+    alvo = normalizar(texto)
+    for ator in sorted(atores.values(), key=lambda a: -len(a.nome)):
+        prefixo = normalizar(ator.nome)
+        if alvo == prefixo or alvo.startswith(prefixo + " "):
+            return ator, texto[len(ator.nome):].strip()
+    return None, texto
+
+
 def cmd_conversar(atores, resto, turnos, llm):
     """Faz dois atores conversarem. O orquestrador só leva o envelope de um para o outro."""
-    partes = resto.split(maxsplit=2)
-    if len(partes) < 3:
-        print("Uso: /conversar <ator1> <ator2> <tópico>")
+    a, resto = _consumir_nome_ator(resto, atores)
+    b, resto = _consumir_nome_ator(resto, atores) if a else (None, resto)
+    topico = resto.strip()
+
+    if a is None or b is None or not topico:
+        print("Uso: /conversar <ator1> <ator2> <tópico>  (nomes com espaço são aceitos, ex.: Ana Carvalho)")
         return
-    a, b = atores.get(partes[0].lower()), atores.get(partes[1].lower())
-    if a is None or b is None or a is b:
+    if a is b:
         print("Escolha dois atores diferentes (veja /atores).")
         return
-    topico = partes[2]
 
     a.nova_conversa(b.nome)
     b.nova_conversa(a.nome)

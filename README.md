@@ -81,7 +81,7 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
 | `/debug` | Liga/desliga o painel automático após cada resposta |
 | `/tracos <traço> <0 a 1>` | Muda um traço do Ator atual na hora |
 | `/novo <nome>` | Cria um Ator novo avulso (um `.db` novo) |
-| `/conversar <A> <B> <tópico>` | Faz A e B conversarem entre si sobre o tópico |
+| `/conversar <A> <B> <tópico>` | Faz A e B conversarem entre si sobre o tópico (nomes com espaço são aceitos, ex.: `Ana Carvalho`) |
 | `/turnos <N>` | Nº de falas de `/conversar` (padrão 4) |
 | `/ajuda` / `/sair` | Ajuda / encerra o programa |
 
@@ -187,9 +187,11 @@ perde confiança nela, a desconfiança sobe, e as duas memórias ficam marcadas 
 python -m unittest discover -s tests -v
 ```
 
-Testes determinísticos (`tests/test_ator.py`, `tests/test_mundo.py`, `tests/test_roteirista.py`):
-memória e isolamento, mentira não vaza a verdade, DESVIAR exige objetivo + candidato,
-contradição, crenças, objetivos, decaimento de emoção, WorldState e materialização de cena.
+Testes determinísticos (`tests/test_ator.py`, `tests/test_mundo.py`, `tests/test_roteirista.py`,
+`tests/test_main.py`): memória e isolamento, mentira não vaza a verdade, fofoca relatada em
+terceira pessoa (não primeira), DESVIAR exige objetivo + candidato, contradição, crenças,
+objetivos, decaimento de emoção, escolha autônoma de quem interrogar, WorldState, materialização
+de cena e reconhecimento de nomes com espaço em `/conversar`.
 Nenhum chama um LLM de verdade (usam um `FakeLLM` em `tests/apoio.py`) - o que é testado é a
 lógica em CÓDIGO, não a qualidade do texto gerado.
 
