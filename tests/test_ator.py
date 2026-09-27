@@ -10,6 +10,19 @@ from apoio import FakeLLM, TesteComAtores
 from Ator import MEIA_VIDA, barra
 
 
+class LLMGravaPedido(FakeLLM):
+    """FakeLLM que grava o último pedido de mensagens recebido, pra inspecionar a instrução
+    exata que o código mandou (sem precisar de um LLM de verdade só pra checar o texto)."""
+
+    def __init__(self, resposta="..."):
+        super().__init__(resposta)
+        self.ultimo_pedido = None
+
+    def gerar(self, mensagens, **kwargs):
+        self.ultimo_pedido = mensagens
+        return super().gerar(mensagens, **kwargs)
+
+
 class TestMemoria(TesteComAtores):
 
     def test_recordar_respeita_compartilhavel(self):
@@ -91,6 +104,57 @@ class TestDecisoes(TesteComAtores):
             self.assertLessEqual(
                 len(resposta["fatos"]), 1,
                 "fofoca sobre o próprio Joao não pode virar uma segunda decisão além da dele mesmo")
+
+    def test_fofoca_relatada_como_terceiro_nao_primeira_pessoa(self):
+        """Bug real reportado pelo usuário (rodando com LLM de verdade): ao repassar a
+        confissão de Carlos ("Fui eu quem roubou..."), João dizia a frase em primeira pessoa,
+        soando como se ELE tivesse confessado. A instrução para o LLM precisa deixar claro que
+        é um relato de terceiro quando `origem` da memória é outra pessoa (fofoca), não algo
+        que o próprio Ator viu/viveu/sabe por si (ORIGENS_PROPRIAS)."""
+        joao = self.criar_ator("Joao", tracos={"honestidade": 1.0, "dissimulacao": 0.0})
+        joao.mudar_relacao("Fernanda", confianca=0.5)
+        joao.lembrar("Fui eu quem roubou o quadro.", origem="Carlos", sensibilidade=0.1,
+                    compartilhavel=1)
+        llm = LLMGravaPedido()
+        env_pergunta = {"de": "Fernanda", "alvo": "Joao", "tatica": "PEDIR", "texto": "quadro",
+                        "fatos": [], "acusacoes": []}
+
+        random.seed(1)
+        texto_pedido = None
+        for _ in range(50):
+            joao.nova_conversa("Fernanda")
+            joao.responder(env_pergunta, "o quadro", llm, ultima=True)
+            if "Você soube por" in llm.ultimo_pedido[-1]["content"]:
+                texto_pedido = llm.ultimo_pedido[-1]["content"]
+                break
+
+        self.assertIsNotNone(texto_pedido, "REVELAR nunca ocorreu em 50 tentativas")
+        self.assertIn("Você soube por Carlos", texto_pedido)
+        self.assertIn("NUNCA como se fosse sobre você mesmo", texto_pedido)
+
+    def test_observacao_propria_continua_em_primeira_pessoa(self):
+        """O que o próprio Ator viu com os próprios olhos (origem='observacao') não deve ser
+        instruído como relato de terceiro - ele não "ouviu de alguém", ele mesmo presenciou."""
+        joao = self.criar_ator("Joao", tracos={"honestidade": 1.0, "dissimulacao": 0.0})
+        joao.mudar_relacao("Fernanda", confianca=0.5)
+        joao.lembrar("Vi Carlos saindo as pressas do escritorio.", origem="observacao",
+                    sensibilidade=0.1, compartilhavel=1, sobre="Carlos")
+        llm = LLMGravaPedido()
+        env_pergunta = {"de": "Fernanda", "alvo": "Joao", "tatica": "PEDIR", "texto": "escritorio",
+                        "fatos": [], "acusacoes": []}
+
+        esperado = ('Conte a Fernanda, com suas palavras: '
+                    '"Vi Carlos saindo as pressas do escritorio."')
+        random.seed(1)
+        texto_pedido = None
+        for _ in range(50):
+            joao.nova_conversa("Fernanda")
+            joao.responder(env_pergunta, "o quadro", llm, ultima=True)
+            if esperado in llm.ultimo_pedido[-1]["content"]:
+                texto_pedido = llm.ultimo_pedido[-1]["content"]
+                break
+
+        self.assertIsNotNone(texto_pedido, "REVELAR nunca ocorreu em 50 tentativas")
 
     def test_desviar_exige_objetivo_e_candidato(self):
         """DESVIAR não pode ser só personalidade: precisa de um objetivo ativo de alta

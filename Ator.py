@@ -193,6 +193,11 @@ def barra(valor, largura=10):
     return "█" * cheio + "░" * (largura - cheio) + f" {valor:.2f}"
 
 
+# Valores de `origem` que significam "eu sei disso por mim mesmo" (vivi/vi/fui informado
+# diretamente), não "outra pessoa me contou". Qualquer outro valor de origem é o NOME de quem
+# contou - ou seja, é uma fofoca/relato de terceiro (ver responder(), item 4).
+ORIGENS_PROPRIAS = {"sistema", "observacao", "usuario"}
+
 # Palavras que não ajudam a achar memórias parecidas.
 PALAVRAS_COMUNS = {
     "que", "com", "por", "para", "pra", "uma", "dos", "das", "nos", "nas", "mas", "como",
@@ -891,13 +896,15 @@ class Agente:
                       f"sobre: {fato['texto']!r}")
             decisoes_debug.append((fato["texto"], decisao, p))
             if decisao == "REVELAR":
-                fatos_saida.append({"texto": fato["texto"], "origem_id": fato["id"]})
+                fatos_saida.append({"texto": fato["texto"], "origem_id": fato["id"],
+                                    "origem": fato["origem"]})
                 self.contados.add((outro, fato["id"]))
             elif decisao == "MENTIR":
                 # O prompt recebe SÓ a versão falsa: a verdade não entra nele. origem_id é o
                 # MESMO da verdade (é o mesmo fato-base) - se este Ator revelar a verdade sobre
                 # ele depois, quem ouviu as duas versões pega a contradição (ver receber()).
-                fatos_saida.append({"texto": fato["versao_falsa"], "origem_id": fato["id"]})
+                fatos_saida.append({"texto": fato["versao_falsa"], "origem_id": fato["id"],
+                                    "origem": fato["origem"]})
                 self.mudar_estado("culpa", 0.1 + 0.4 * self.pers["tracos"]["empatia"])  # empatia = mais culpa
             elif decisao == "DESVIAR":
                 alvo_falso = extra["alvo_falso"]
@@ -909,9 +916,21 @@ class Agente:
             else:
                 escondeu = True
 
-        # 4) Transforma as decisões em instruções concretas para o LLM.
+        # 4) Transforma as decisões em instruções concretas para o LLM. Um fato que EU vivi ou
+        # sei por mim mesmo (origem 'sistema'/'observacao'/'usuario') pode ser contado em
+        # primeira pessoa direto. Um fato que outra PESSOA me contou (fofoca/testemunho
+        # relatado) precisa ser instruído como relato de terceiro - senão o LLM repete um texto
+        # em primeira pessoa (ex.: uma confissão) como se fosse dele mesmo, um bug real: alguém
+        # relatando "fui eu quem roubou" ao repassar a confissão de outra pessoa.
         for fato in fatos_saida:
-            instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato["texto"]}".')
+            if fato["origem"] not in ORIGENS_PROPRIAS:
+                instrucoes.append(
+                    f'Você soube por {fato["origem"]}: "{fato["texto"]}". Conte isso a {outro} '
+                    f'como algo que você ouviu de {fato["origem"]} ("ouvi dizer que...", '
+                    f'"{fato["origem"]} me contou que..."), NUNCA como se fosse sobre você mesmo '
+                    f"ou algo que você fez.")
+            else:
+                instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato["texto"]}".')
         for ac in acusacoes:
             instrucoes.append(f'Sugira, com cautela e sem provas concretas, que {ac["assunto"]} '
                               f"pode ter algo a ver com isso. Não admita nada sobre você mesmo.")
