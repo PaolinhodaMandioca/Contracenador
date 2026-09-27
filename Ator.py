@@ -659,8 +659,9 @@ class Agente:
         del h[:-6]
 
     def _falar(self, mensagens, llm):
-        print(f"\n[{self.nome}] ", end="", flush=True)
-        return llm.gerar(mensagens, slot=self.slot, ao_vivo=True) or "..."
+        if self.mostrar:
+            print(f"\n[{self.nome}] ", end="", flush=True)
+        return llm.gerar(mensagens, slot=self.slot, ao_vivo=self.mostrar) or "..."
 
     # ------------------------------------------------------------------
     # 4.6) CONVERSA COM VOCÊ (o dono): sem mentiras, com acesso a todas as memórias

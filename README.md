@@ -18,6 +18,7 @@ Veja a visão completa e o roadmap do projeto em
 | `roteirista.py` | O Roteirista: gera a cena e os 5 personagens via LLM (JSON estruturado) e materializa os `.db` |
 | `main.py` | Terminal + orquestrador; sobe/derruba os servidores llama-server automaticamente |
 | `atores/` | Criada na 1ª execução, um `.db` por ator (gerado pelo Roteirista ou por `/novo`) |
+| `tests/` | Testes automatizados e a simulação em lote (ver seção "Testes" abaixo) |
 | `cenario/` | Guarda `cena.json` (roteiro) e `mundo.db` (WorldState) da cena atual |
 
 Não há nada para instalar além de Python 3.8+ e o `llama-server` (llama.cpp). `main.py` sobe os
@@ -169,6 +170,31 @@ perde confiança nela, a desconfiança sobe, e as duas memórias ficam marcadas 
   campo `viu` gerado pelo Roteirista).
 - Salvar fatos é sempre explícito (`/lembrar` ou gerado pelo Roteirista); o Ator não extrai fatos
   sozinho da conversa.
+
+## Testes
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Testes determinísticos (`tests/test_ator.py`, `tests/test_mundo.py`, `tests/test_roteirista.py`):
+memória e isolamento, mentira não vaza a verdade, DESVIAR exige objetivo + candidato,
+contradição, crenças, objetivos, decaimento de emoção, WorldState e materialização de cena.
+Nenhum chama um LLM de verdade (usam um `FakeLLM` em `tests/apoio.py`) - o que é testado é a
+lógica em CÓDIGO, não a qualidade do texto gerado.
+
+```bash
+python tests/simular_lote.py --n 500
+```
+
+Roda muitas cenas de investigação "de cabeça" (sem terminal, sem LLM) e imprime estatísticas
+agregadas (taxa de vitória por confissão/dedução, rodadas médias, mentiras, contradições) - serve
+para calibrar os pesos de `escolher_acao()`/`escolher_tatica()` por número em vez de só no olho.
+Não é um teste automatizado (não entra no `unittest discover`): é uma ferramenta de calibração, e
+reimplementa uma versão simplificada e não-interativa do loop de `/cena` (ver aviso no topo do
+arquivo). Com os pesos padrão atuais, por exemplo, contradições praticamente não ocorrem - o
+culpado raramente muda de postura (mentir → confessar) sob a pressão simulada, o que é um
+candidato a ajuste de pesos futuro, não um bug.
 
 ## Roadmap
 
