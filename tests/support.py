@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from actor import Actor, DEFAULT_TRAITS, create_actor
+from contracenador.agents.agent import Actor, DEFAULT_TRAITS, create_actor
 
 
 class FakeLLM:

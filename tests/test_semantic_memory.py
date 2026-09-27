@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from support import ActorTestCase, FakeLLM
 
-from actor import _cosine_similarity, _deserialize_vector, _serialize_vector
+from contracenador.agents.agent import _cosine_similarity, _deserialize_vector, _serialize_vector
 
 
 class FakeLLMWithEmbeddings(FakeLLM):

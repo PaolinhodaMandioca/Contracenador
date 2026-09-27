@@ -7,7 +7,7 @@ import unittest
 
 from support import ActorTestCase, FakeLLM
 
-from actor import HALF_LIFE, bar
+from contracenador.agents.agent import HALF_LIFE, bar
 
 
 class LLMRecordsRequest(FakeLLM):
@@ -43,6 +43,34 @@ class TestMemory(ActorTestCase):
         id2 = actor.remember("O cofre fica no escritorio.")
         self.assertEqual(id1, id2)
         self.assertEqual(len(actor.list_memories()), 1)
+
+    def test_revealed_fact_carries_its_subject(self):
+        witness = self.create_actor("Bia", traits={"honesty": 1.0})
+        witness.remember(
+            "Joao estava perto da joia.", origin="observation", sensitivity=0.1,
+            shareable=1, about="Joao",
+        )
+        witness.change_relationship("Ana", trust=0.5)
+        witness.new_conversation("Ana")
+
+        response = witness.respond(
+            {"from": "Ana", "target": "Bia", "tactic": "ASK", "text": "joia",
+             "facts": [], "accusations": []},
+            "joia", FakeLLM(), last=True,
+        )
+
+        self.assertEqual(response["facts"][0]["subject"], "Joao")
+
+    def test_received_fact_preserves_subject_for_relay(self):
+        actor = self.create_actor("Ana")
+        actor.receive({
+            "from": "Bia", "target": "Ana", "tactic": "NONE", "text": "Ela contou.",
+            "facts": [{"text": "Joao estava perto da joia.", "source_id": 4,
+                       "subject": "Joao"}],
+            "accusations": [],
+        })
+
+        self.assertEqual(actor.list_memories()[0]["about"], "Joao")
 
 
 class TestDecisions(ActorTestCase):
@@ -227,6 +255,22 @@ class TestContradiction(ActorTestCase):
 
 
 class TestAccusation(ActorTestCase):
+
+    def test_influence_conversation_seeds_a_relayable_suspicion(self):
+        culprit = self.create_actor("Joao")
+        witness = self.create_actor("Bia")
+
+        envelope = culprit.open_influence_conversation(
+            "Bia", "o roubo da joia", "Caio", FakeLLM(), weight=0.25,
+        )
+        witness.receive(envelope)
+
+        belief = witness.belief("Caio é o culpado")
+        rumor = next(memory for memory in witness.list_memories() if memory["about"] == "Caio")
+        self.assertEqual(envelope["accusations"][0]["subject"], "Caio")
+        self.assertAlmostEqual(belief["confidence"], 0.75)
+        self.assertEqual(rumor["origin"], "Joao")
+        self.assertEqual(rumor["shareable"], 1)
 
     def test_accused_does_not_believe_their_own_accusation(self):
         caio = self.create_actor("Caio")

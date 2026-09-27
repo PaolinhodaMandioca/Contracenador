@@ -1,13 +1,11 @@
 """
-batch_simulation.py - roda muitas cenas de investigação "de cabeça" (sem terminal, sem LLM de
-verdade) e imprime estatísticas agregadas. Serve para calibrar os pesos de choose_action()/
-choose_tactic() por número, em vez de só no olho rodando uma cena de cada vez.
+batch_simulation.py - roda cenas de investigação sem terminal e sem servidor LLM real, e imprime
+estatísticas agregadas. Reutiliza o ciclo privado de pares de simulation.py, mas simplifica a
+política externa de seleção de suspeitos e as condições de vitória de /cena.
 
 ATENÇÃO - não é um teste automatizado (não faz parte do `unittest discover`): é uma ferramenta
-de calibração. Reimplementa uma versão simplificada e NÃO-interativa do loop de `/cena`
-(main.cmd_scene) porque cmd_scene foi escrito para o terminal (usa input()/print() a cada
-rodada). Se a lógica de decisão do jogo mudar (choose_action, crenças do investigador,
-condição de vitória), mantenha esta simulação em mente - ela pode ficar desatualizada.
+de calibração. Se a política de investigação ou as condições de vitória em main.cmd_scene
+mudar, revise esta simulação. O fluxo de diálogo entre os dois participantes é compartilhado.
 
 Uso:
     python tests/batch_simulation.py --n 200
@@ -23,9 +21,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from actor import Actor, DEFAULT_TRAITS, create_actor
-from world import (evidence_by_origin, open_world, position, register_evidence,
-                   register_event, register_location)
+from contracenador.agents.agent import Actor, DEFAULT_TRAITS, create_actor
+from contracenador.simulation import SimulationEngine
+from contracenador.world import (evidence_by_origin, open_world, position, register_evidence,
+                                 register_event, register_location)
 
 
 class DeafMuteLLM:
@@ -124,41 +123,46 @@ def simulate_one_scene(seed, max_rounds):
         llm = DeafMuteLLM()
         lies, winner, rounds_used = 0, "guilty_escaped", max_rounds
 
-        for round_ in range(1, max_rounds + 1):
-            # Mesmo mecanismo do jogo de verdade (main.cmd_scene): quem interrogar é decisão do
-            # investigador via choose_investigation_target(). Como o LLM aqui é surdo-mudo, a
-            # resposta nunca casa com um nome e o código sempre cai no fallback por pontuação -
-            # o que é exatamente o comportamento que queremos calibrar.
+        def select_investigation_pair(available_agents, turn_number, history):
             target_name = ana.choose_investigation_target([s.name for s in suspects], truth, llm)
             target = next(s for s in suspects if s.name == target_name)
+            return ana, target
 
-            question_env = ana.open_conversation(target.name, truth, llm)
-            answer_env = target.respond(question_env, truth, llm)
-            ana.receive(answer_env)
+        def process_exchange(initiator, respondent, _question, answer, _turn, _exchange):
+            nonlocal lies
+            if respondent is joao:
+                lies += sum(1 for fact in answer.get("facts", []) if fact["text"] != truth)
 
-            if target is joao:
-                for f in answer_env.get("facts", []):
-                    if f["text"] != truth:
-                        lies += 1
+            for evidence in evidence_by_origin(world, respondent.name):
+                if evidence["subject"] and evidence["subject"] != ana.name:
+                    ana.update_belief(
+                        f"{evidence['subject']} é o culpado", delta=0.2,
+                        origin=respondent.name, subject=evidence["subject"],
+                        evidence=f"evidence:{evidence['id']}",
+                    )
+            return False
 
-            for ev in evidence_by_origin(world, target.name):
-                if ev["subject"] and ev["subject"] != ana.name:
-                    ana.update_belief(f"{ev['subject']} é o culpado", delta=0.2,
-                                      origin=target.name, subject=ev["subject"],
-                                      evidence=f"evidence:{ev['id']}")
-
-            for other in suspects:
-                if other is not target:
-                    other.receive(answer_env)
-
+        def check_outcome(turn_result):
+            nonlocal winner, rounds_used
+            rounds_used = turn_result["turn"]
             memories = [m["text"].strip() for m in ana.list_memories()]
             if truth in memories:
-                winner, rounds_used = "confession", round_
-                break
+                winner = "confession"
+                return True
             belief = ana.belief(f"{joao.name} é o culpado")
             if belief and belief["confidence"] >= 0.75:
-                winner, rounds_used = "deduction", round_
-                break
+                winner = "deduction"
+                return True
+            return False
+
+        engine = SimulationEngine([ana] + suspects, select_investigation_pair)
+        engine.run(
+            truth,
+            llm,
+            max_turns=max_rounds,
+            on_exchange=process_exchange,
+            on_turn_complete=check_outcome,
+        )
 
         return {"winner": winner, "rounds": rounds_used, "lies": lies,
                 "contradictions": len(ana.contradictions())}

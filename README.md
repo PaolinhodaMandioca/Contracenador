@@ -6,23 +6,36 @@ cena e os personagens; os **Atores** (LLM menor) interpretam. Quem decide se um 
 esconde, mente ou ameaça é o **código** (não o modelo); o LLM só escreve a fala.
 
 Veja a visão completa e o roadmap do projeto em
-[`Contracenador_Roadmap.md`](Contracenador_Roadmap.md).
+[`docs/Contracenador_Roadmap.md`](docs/Contracenador_Roadmap.md).
 
 ## Arquivos
 
 | Arquivo | Papel |
 |---|---|
-| `llm.py` | Cliente do llama-server (só biblioteca padrão): fala, gera cena e embeddings |
-| `actor.py` | Cérebro do Ator (`class Actor`): banco, memória, crenças, emoções, decisões, prompts |
-| `world.py` | O WorldState: locais, personagens, eventos e evidências (a verdade objetiva da cena) |
-| `names.py` | Banco de nomes prontos; o código sorteia, o Roteirista só usa (não inventa nomes) |
-| `screenwriter.py` | O Roteirista: gera a cena e os 5 personagens via LLM (JSON estruturado) e materializa os `.db` |
-| `main.py` | Terminal + orquestrador; sobe/derruba os servidores llama-server automaticamente |
+| `contracenador/agents/agent.py` | API `Actor`, personalidade verbal e memória do agente |
+| `contracenador/agents/personality.py` | Nomes e perfis determinísticos de personalidade |
+| `contracenador/agents/beliefs.py`, `emotions.py`, `relationships.py`, `actions.py` | Crenças, estado emocional, relações e políticas de decisão |
+| `contracenador/memory/sqlite.py` / `embeddings.py` | Conexões de memória e operações vetoriais |
+| `contracenador/world/world.py` | Esquema e abertura do WorldState |
+| `contracenador/world/locations.py`, `events.py`, `evidence.py` | Locais, eventos e evidências do mundo |
+| `contracenador/simulation/engine.py`, `scheduler.py`, `turn.py` | Execução de cena, seleção de turnos e troca privada |
+| `contracenador/llm/client.py` / `model_manager.py` | Cliente e ciclo de vida dos servidores llama.cpp |
+| `contracenador/scenarios/generator.py`, `validator.py`, `loader.py` | Geração, validação e materialização de cenas |
+| `contracenador/cli/main.py` | CLI e orquestração do jogo |
+| `main.py` | Entrada compatível: `python main.py` |
+| `screenwriter.py` | Entrada compatível para o gerador de cenas |
 | `atores/` | Criada na 1ª execução, um `.db` por ator (gerado pelo Roteirista ou por `/novo`) |
 | `tests/` | Testes automatizados e a simulação em lote (ver seção "Testes" abaixo) |
 | `cenario/` | Guarda `cena.json` (roteiro) e `world.db` (WorldState) da cena atual |
 
-Não há nada para instalar além de Python 3.8+ e o `llama-server` (llama.cpp). `main.py` sobe os
+`TurnScheduler` em `contracenador/simulation/scheduler.py` separa execução da política de escolha:
+ela recebe os agentes, o número do turno e o histórico, e devolve um par ou `None` para encerrar.
+As regras de investigação continuam na CLI; outros tipos de cena podem fornecer políticas próprias.
+Os comportamentos de crença, emoção, relação e ação ainda compartilham o estado do `Actor` em
+`agents/agent.py`; os métodos públicos delegam a implementação aos módulos de domínio acima.
+
+Não há dependências Python de runtime além da biblioteca padrão; é necessário Python 3.8+ e o
+`llama-server` (llama.cpp). `main.py` sobe os
 servidores sozinho — não é preciso rodar `llama-server` manualmente.
 
 Todo o código (módulos, classes, funções, variáveis, colunas de banco) é em inglês; só os
@@ -33,8 +46,8 @@ já que o próprio jogo (diálogos, prompts) é em português.
 
 - **Atores**: `Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M` (padrão) — respostas rápidas, uma inferência
   por fala.
-- **Roteirista**: `Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M` (padrão) — só entra em ação em `/roteiro`,
-  para gerar a cena e os personagens com mais qualidade.
+- **Roteirista**: `Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M` (padrão) — inicia primeiro em cada save novo
+  e também é carregado temporariamente por `/roteiro` para gerar a cena e os personagens.
 
 Os modelos padrão são baixados automaticamente do Hugging Face na primeira execução (flag `-hf`
 do `llama-server`). Para usar um `.gguf` local, passe o caminho do arquivo em vez do repositório.
@@ -49,8 +62,19 @@ manual.
 python main.py
 ```
 
-Se a pasta `atores/` estiver vazia, o programa já pergunta o tema e chama o Roteirista para criar
-a primeira cena. Flags úteis:
+Antes de iniciar o jogo, a aplicação verifica Python, `llama-server`, modelos, portas e
+permissões das pastas. Se algum requisito falhar, a mensagem lista o problema e como agir;
+essa etapa ocorre antes de apagar o save anterior. Para rodar apenas as verificações, sem
+iniciar modelos, baixar arquivos ou alterar saves:
+
+```bash
+python main.py --verificar-ambiente
+```
+
+A primeira cena será solicitada durante a inicialização. Flags úteis:
+Toda execução normal de `main.py` começa um save novo: limpa o conteúdo de `atores/` e `cenario/`,
+pergunta o tema, inicia primeiro o modelo de 14B para gerar a cena e depois carrega o modelo de
+7B para continuar o jogo. Os dados do save anterior são apagados permanentemente. Flags úteis:
 
 ```bash
 python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
@@ -58,9 +82,15 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
                 --slots 2 --pasta atores --cenario cenario
 ```
 
+Por padrão, o llama-server recebe `--fit on` para ajustar automaticamente o offload às GPUs e à
+VRAM disponível, usando o máximo que couber. O backend depende de como o `llama-server` foi
+compilado. Se quiser fixar manualmente o limite de camadas, use as flags abaixo; por exemplo,
+`--camadas-gpu-atores 25 --camadas-gpu-roteirista 10`.
+
 | Flag | Efeito |
 |---|---|
 | `--modelo-atores` / `--modelo-roteirista` | Repositório HF (`Org/Repo:arquivo.gguf`) ou caminho local `.gguf` |
+| `--camadas-gpu-atores` / `--camadas-gpu-roteirista` | Limite manual de camadas de cada modelo na GPU (padrão: ajuste automático; use 0 para CPU) |
 | `--porta-atores` / `--porta-roteirista` | Portas dos dois servidores (padrão 8080/8081) |
 | `--slots` | Nº de slots KV do llama-server dos Atores (cada Ator sempre usa o mesmo slot) |
 | `--threads` | Núcleos de CPU (padrão: automático) |
@@ -73,7 +103,7 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
 |---|---|
 | (texto normal) | Conversa com o Ator atual |
 | `/cenario` | Mostra o incidente e os personagens da cena atual |
-| `/cena [rodadas]` ou `/sala` | Encena a investigação do início ao fim, sem pausa: o investigador decide sozinho quem interrogar a cada rodada, até descobrir a verdade ou esgotar as rodadas (padrão 15) |
+| `/cena [rodadas]` ou `/sala` | Investigação privada: interroga um suspeito e pode intercalar uma conversa do culpado com uma testemunha para plantar suspeita; até 10 trocas por linha ativa |
 | `/roteiro [tema]` | Gera uma nova cena com 5 Atores via LLM (troca para o modelo do Roteirista e volta) |
 | `/atores` | Lista os Atores carregados |
 | `/falar <nome>` | Troca o Ator com quem você conversa |
@@ -117,7 +147,7 @@ tática `ASK`/`THREATEN` e as chances). Para uma conversa livre entre dois Atore
 | trust, fear, distrust, favor_owed | relação | Empurram a decisão de revelar a quem pergunta |
 | sensitivity | fato | Quanto mais sensível, mais difícil de revelar |
 
-Os pesos estão em `choose_action()` e `choose_tactic()` (em `actor.py`), e as meias-vidas em
+Os pesos estão em `choose_action()` e `choose_tactic()` (em `contracenador/agents/agent.py`), e as meias-vidas em
 `HALF_LIFE`. Regras que valem a pena conhecer:
 
 - **Isolamento por construção:** nas conversas com outro Ator só entram memórias
@@ -129,12 +159,12 @@ Os pesos estão em `choose_action()` e `choose_tactic()` (em `actor.py`), e as m
 
 ## WorldState e crenças
 
-Desde a Fase 1 do roadmap, a verdade de cada cena vive em `cenario/world.db` (módulo `world.py`):
+Desde a Fase 1 do roadmap, a verdade de cada cena vive em `cenario/world.db` (pacote `contracenador/world/`):
 locais, personagens, **eventos** (o que de fato aconteceu) e **evidências** (o que cada testemunha
 forneceu, e sobre quem). É separado da memória de cada Ator — verdade ≠ conhecimento ≠ crença
 (roadmap, seção 10).
 
-Cada Ator também tem uma tabela de **crenças** (`actor.py`): uma proposição com um nível de
+Cada Ator também tem uma tabela de **crenças** (`contracenador/agents/agent.py`): uma proposição com um nível de
 confiança que evidências vão ajustando (`update_belief`). É o mesmo mecanismo tanto para crença
 social quanto para hipótese de investigação — o investigador de `/cena` forma e reforça a hipótese
 `"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
@@ -143,7 +173,7 @@ social quanto para hipótese de investigação — o investigador de `/cena` for
 ## Nomes dos personagens vêm de um banco, não da criatividade do LLM
 
 Escolher um nome não exige entendimento de contexto - é o tipo de decisão que cabe ao código.
-`names.py` sorteia 5 nomes únicos ("Primeiro Sobrenome", sem repetir nem o primeiro nome nem o
+`contracenador/agents/personality.py` sorteia 5 nomes únicos ("Primeiro Sobrenome", sem repetir nem o primeiro nome nem o
 sobrenome entre si) e o Roteirista recebe a ordem de **usar exatamente esses nomes** ao escrever
 a trama - ele só decide personalidade, papel e quem viu o quê, os nomes já vêm prontos. Isso evita
 nomes malformados, incompletos ou repetidos, e ainda economiza tokens do LLM com algo que não
@@ -166,7 +196,7 @@ Além de traços fixos, cada Ator pode ter **objetivos** estruturados (prioridad
 status) - não é só uma memória de texto. O Roteirista já dá ao investigador o objetivo dele e ao
 culpado o objetivo "Não ser descoberto".
 
-A antiga decisão REVEAL/HIDE/LIE (`choose_action()` em `actor.py`) ganhou uma quarta opção,
+A antiga decisão REVEAL/HIDE/LIE (`choose_action()` em `contracenador/agents/agent.py`) ganhou uma quarta opção,
 **DEFLECT**: quando um objetivo ativo de alta prioridade justifica o risco (e a personalidade
 combina - deceit alto, empathy baixo), o código pode fazer o Ator insinuar que um terceiro
 está envolvido, em vez de só mentir ou se esquivar. A acusação vira uma crença fraca em quem ouve
@@ -183,7 +213,7 @@ perde confiança nela, a desconfiança sobe, e as duas memórias ficam marcadas 
 ## Memória semântica
 
 `recall()` busca por palavra em comum (rápido, mas não pega paráfrase). `recall_semantic()` usa o
-embedding do próprio LLM já carregado (`LLM.embedding` em `llm.py`, endpoint `/v1/embeddings` ou
+embedding do próprio LLM já carregado (`LLM.embedding` em `contracenador/llm/client.py`, endpoint `/v1/embeddings` ou
 `/embedding` do llama-server) para achar memórias parecidas por **significado** - "perto do
 cofre" pode casar com "saindo do escritório" mesmo sem palavra igual. O embedding de cada memória
 é calculado uma única vez e fica salvo no `.db`; buscas seguintes só gastam uma chamada ao LLM (a
@@ -212,7 +242,7 @@ palavra em comum), mesmo que o ranking dela sozinha não seja confiável.
   mentiu e depois confessou) - a confiança nela cai e a memória fica marcada (ver `/painel`). Duas
   testemunhas diferentes discordando uma da outra sobre o mesmo assunto não é pego ainda: exigiria
   comparar texto livre semanticamente.
-- Só existe 1 local por cenário ainda: a percepção automática por local (em `world.py`) só é usada
+- Só existe 1 local por cenário ainda: a percepção automática por local (em `contracenador/world/`) só é usada
   para eventos durante a cena, não para decidir quem viu o crime inicial (isso continua vindo do
   campo `saw` gerado pelo Roteirista).
 - Salvar fatos é sempre explícito (`/lembrar` ou gerado pelo Roteirista); o Ator não extrai fatos
@@ -241,13 +271,13 @@ python tests/batch_simulation.py --n 500
 Roda muitas cenas de investigação "de cabeça" (sem terminal, sem LLM) e imprime estatísticas
 agregadas (taxa de vitória por confissão/dedução, rodadas médias, mentiras, contradições) - serve
 para calibrar os pesos de `choose_action()`/`choose_tactic()` por número em vez de só no olho.
-Não é um teste automatizado (não entra no `unittest discover`): é uma ferramenta de calibração, e
-reimplementa uma versão simplificada e não-interativa do loop de `/cena` (ver aviso no topo do
-arquivo). Com os pesos padrão atuais, por exemplo, contradições praticamente não ocorrem - o
+Não é um teste automatizado (não entra no `unittest discover`): é uma ferramenta de calibração.
+Ela reutiliza o scheduler e o diálogo privado, mas simplifica a política de seleção e as condições
+de vitória de `/cena` (ver aviso no topo do arquivo). Com os pesos padrão atuais, por exemplo, contradições praticamente não ocorrem - o
 culpado raramente muda de postura (mentir → confessar) sob a pressão simulada, o que é um
 candidato a ajuste de pesos futuro, não um bug.
 
 ## Roadmap
 
 O plano de evolução do projeto (WorldState, crenças vs. verdade, evidências, objetivos, Diretor,
-Cenógrafo etc.) está em [`Contracenador_Roadmap.md`](Contracenador_Roadmap.md).
+Cenógrafo etc.) está em [`docs/Contracenador_Roadmap.md`](docs/Contracenador_Roadmap.md).

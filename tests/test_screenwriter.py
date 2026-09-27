@@ -11,9 +11,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from actor import Actor
-from screenwriter import extract_json, generate_scene_llm, materialize_scene, validate_scene_data
-from world import evidence_for_event, find_event_by_type, open_world
+from contracenador.agents.agent import Actor
+from contracenador.scenarios.generator import extract_json, generate_scene_llm, materialize_scene, validate_scene_data
+from contracenador.world import evidence_for_event, find_event_by_type, open_world
 
 
 class TestExtractJson(unittest.TestCase):
@@ -112,6 +112,51 @@ class TestMaterializeScene(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_new_scene_clears_previous_actor_and_scenario_files(self):
+        def make_scene(title, guilty, investigator):
+            return {
+                "scene": title,
+                "characters": [
+                    {"name": guilty, "role": "guilty", "truth": f"{guilty} fez isso.",
+                     "alibi": "Eu estava em outro lugar.", "traits": {}, "examples": []},
+                    {"name": investigator, "role": "investigator", "goal": "Descobrir a verdade",
+                     "traits": {}, "examples": []},
+                ],
+            }
+
+        materialize_scene(make_scene("História antiga", "Joao", "Ana"),
+                          actors_folder=self.actors_folder,
+                          scenario_folder=self.scenario_folder, slots=2)
+        os.makedirs(os.path.join(self.actors_folder, "backup"))
+        with open(os.path.join(self.scenario_folder, "anotacoes.txt"), "w", encoding="utf-8") as file:
+            file.write("estado antigo")
+
+        materialize_scene(make_scene("História nova", "Caio", "Bia"),
+                          actors_folder=self.actors_folder,
+                          scenario_folder=self.scenario_folder, slots=2)
+
+        self.assertEqual(set(os.listdir(self.actors_folder)), {"caio.db", "bia.db"})
+        self.assertEqual(set(os.listdir(self.scenario_folder)), {"cena.json", "world.db"})
+
+    def test_overlapping_output_folders_are_rejected_without_deleting_data(self):
+        scene = {
+            "scene": "Uma cena",
+            "characters": [
+                {"name": "Joao", "role": "guilty", "truth": "Joao fez isso.",
+                 "alibi": "Eu estava em outro lugar."},
+                {"name": "Ana", "role": "investigator", "goal": "Descobrir a verdade"},
+            ],
+        }
+        marker = os.path.join(self.tmp, "preservar.txt")
+        with open(marker, "w", encoding="utf-8") as file:
+            file.write("nao apagar")
+
+        with self.assertRaisesRegex(ValueError, "devem ser separadas"):
+            materialize_scene(scene, actors_folder=self.tmp,
+                              scenario_folder=os.path.join(self.tmp, "cenario"))
+
+        self.assertTrue(os.path.exists(marker))
 
     def test_records_crime_and_evidence_in_the_worldstate(self):
         data = {

@@ -15,42 +15,29 @@ concreta e escreve a fala. Vantagens:
   * a verdade nem entra no prompt quando o ator vai esconder ou mentir,
     então o modelo pequeno não tem como "vazar" o que não recebeu.
 """
-import array
 import json
-import math
-import random
 import re
-import sqlite3
 import time
 import unicodedata
 
-import colors
+from .. import colors
+from . import beliefs as belief_state
+from . import emotions as emotional_state
+from . import relationships as social_state
+from ..memory.embeddings import (
+    cosine_similarity as _cosine_similarity,
+    deserialize_vector as _deserialize_vector,
+    serialize_vector as _serialize_vector,
+)
+from ..memory.sqlite import connect_database
+from . import actions as action_policy
+from .actions import INTERROGATION_FATIGUE, STANCE_PERSISTENCE, sigmoid
 
 # ============================================================================
 # 1) CONFIGURAÇÕES GERAIS
 # ============================================================================
 
-# Em quantos segundos cada emoção cai pela metade. O decaimento é "preguiçoso":
-# só é calculado quando o valor é lido (nada fica rodando em segundo plano).
-HALF_LIFE = {"guilt": 1800, "fear": 900, "frustration": 600}
-
-# Quantas vezes seguidas choose_action() pode repetir a MESMA postura sobre o mesmo fato com o
-# mesmo interlocutor antes de ser forçado a sortear de novo, mesmo sem nada ter mudado o
-# suficiente (ver "postura persistente" em choose_action). Sem este teto, um culpado com
-# personalidade decidida podia ficar preso em DEFLECT/HIDE pra sempre contra um investigador
-# manso (que nunca ameaça o bastante pra mexer o placar em 0.5) - bug real: 15 rodadas
-# pressionando o culpado certo, sem nunca sequer tentar de novo a sorte de revelar.
-STANCE_PERSISTENCE = 3
-
-# Quanto cada interrogatório já feito a alguém desconta da PRÓXIMA vez que essa mesma pessoa é
-# avaliada como alvo (ver Actor._suspicion_score) - uma "fadiga" que cresce a cada vez que o
-# investigador já ouviu aquela pessoa, empurrando-o a distribuir as perguntas em vez de fixar
-# num só suspeito. Sem isso, o LLM (7B) que escolhe o alvo tende a sempre repetir quem aparece
-# primeiro na lista quando os placares empatam - e uma exclusão "dura" (tirar da lista após N
-# vezes seguidas) não resolve: vira um ciclo fechado entre só DOIS nomes, excluindo os outros
-# pra sempre (bug real observado num teste: o investigador ping-pongava só entre duas
-# testemunhas inocentes e nunca chegava a interrogar o culpado de novo).
-INTERROGATION_FATIGUE = 0.12
+HALF_LIFE = emotional_state.HALF_LIFE
 
 # Traços de personalidade (0 a 1). Servem de "pesos" nas funções de decisão.
 DEFAULT_TRAITS = {
@@ -149,8 +136,7 @@ CREATE TABLE IF NOT EXISTS beliefs (
 
 def open_database(path):
     """Abre (ou cria) o arquivo .db de um ator e garante que as tabelas existem."""
-    db = sqlite3.connect(path)
-    db.row_factory = sqlite3.Row  # permite ler colunas por nome: row["text"]
+    db = connect_database(path)
     db.executescript(PRAGMAS + TABLES)
     if db.execute("PRAGMA user_version").fetchone()[0] == 0:
         db.executescript(MARK)
@@ -165,6 +151,47 @@ def _migrate(db):
     português, que é renomeado coluna a coluna via ALTER TABLE ... RENAME COLUMN (suportado
     desde o SQLite 3.25).
     """
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+    # Bases antigas usam nomes em português e colunas ainda mais antigas; normalizamos tudo
+    # para o esquema atual antes de qualquer SELECT/INSERT do código principal.
+    if "memories" not in tables and "memorias" in tables:
+        db.execute("ALTER TABLE memorias RENAME TO memories")
+        db.commit()
+        tables.discard("memorias")
+        tables.add("memories")
+
+    if "relationships" not in tables and "relacoes" in tables:
+        db.execute("ALTER TABLE relacoes RENAME TO relationships")
+        db.commit()
+        tables.discard("relacoes")
+        tables.add("relationships")
+
+    if "state" not in tables and "estado" in tables:
+        db.execute("ALTER TABLE estado RENAME TO state")
+        db.commit()
+        tables.discard("estado")
+        tables.add("state")
+
+    # config: a primeira versão do projeto usava "valor"/"chave" em vez de "value"/"key".
+    config_columns = {row["name"] for row in db.execute("PRAGMA table_info(config)")}
+    if not config_columns:
+        db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        db.commit()
+        config_columns = {"key", "value"}
+    if "key" not in config_columns and "chave" in config_columns:
+        db.execute("ALTER TABLE config RENAME COLUMN chave TO key")
+        db.commit()
+        config_columns.discard("chave")
+        config_columns.add("key")
+    if "value" not in config_columns:
+        if "valor" in config_columns:
+            db.execute("ALTER TABLE config RENAME COLUMN valor TO value")
+        else:
+            db.execute("ALTER TABLE config ADD COLUMN value TEXT")
+        db.commit()
+        config_columns.add("value")
+
     old_to_new = {
         "texto": "text", "data": "timestamp", "origem": "origin", "compartilhavel": "shareable",
         "sensibilidade": "sensitivity", "versao_falsa": "false_version", "sobre": "about",
@@ -192,6 +219,101 @@ def _migrate(db):
         db.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
         db.commit()
 
+    state_columns = {row["name"] for row in db.execute("PRAGMA table_info(state)")}
+    if "key" not in state_columns and "chave" in state_columns:
+        db.execute("ALTER TABLE state RENAME COLUMN chave TO key")
+        db.commit()
+        state_columns.discard("chave")
+        state_columns.add("key")
+    if "value" not in state_columns:
+        if "valor" in state_columns:
+            db.execute("ALTER TABLE state RENAME COLUMN valor TO value")
+        else:
+            db.execute("ALTER TABLE state ADD COLUMN value REAL")
+        db.commit()
+        state_columns.add("value")
+    if "updated_at" not in state_columns:
+        if "atualizado_em" in state_columns:
+            db.execute("ALTER TABLE state RENAME COLUMN atualizado_em TO updated_at")
+        else:
+            db.execute("ALTER TABLE state ADD COLUMN updated_at REAL")
+        db.commit()
+        state_columns.add("updated_at")
+
+    rel_columns = {row["name"] for row in db.execute("PRAGMA table_info(relationships)")}
+    if "other" not in rel_columns and "outro" in rel_columns:
+        db.execute("ALTER TABLE relationships RENAME COLUMN outro TO other")
+        db.commit()
+        rel_columns.discard("outro")
+        rel_columns.add("other")
+    for old_name, new_name in {
+        "confianca": "trust",
+        "medo": "fear",
+        "desconfianca": "distrust",
+        "favor_devido": "favor_owed",
+        "atualizado_em": "updated_at",
+    }.items():
+        if old_name in rel_columns and new_name not in rel_columns:
+            db.execute(f"ALTER TABLE relationships RENAME COLUMN {old_name} TO {new_name}")
+            db.commit()
+            rel_columns.discard(old_name)
+            rel_columns.add(new_name)
+    if "trust" not in rel_columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN trust REAL DEFAULT 0.5")
+        db.commit()
+    if "fear" not in rel_columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN fear REAL DEFAULT 0")
+        db.commit()
+    if "distrust" not in rel_columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN distrust REAL DEFAULT 0")
+        db.commit()
+    if "favor_owed" not in rel_columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN favor_owed REAL DEFAULT 0")
+        db.commit()
+    if "updated_at" not in rel_columns:
+        db.execute("ALTER TABLE relationships ADD COLUMN updated_at REAL")
+        db.commit()
+
+
+def normalize_personality(raw):
+    """Aceita tanto o formato novo em inglês quanto o legado em português."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Personalidade inválida: {raw!r}")
+
+    if all(k in raw for k in ("name", "description", "examples", "traits")):
+        traits = raw.get("traits") or {}
+        return {
+            "name": raw["name"],
+            "description": raw["description"],
+            "examples": raw["examples"],
+            "traits": {**DEFAULT_TRAITS, **traits},
+        }
+
+    data = {
+        "name": raw.get("nome") or raw.get("name") or "",
+        "description": raw.get("descricao") or raw.get("description") or "",
+        "examples": raw.get("exemplos") or raw.get("examples") or [],
+        "traits": raw.get("tracos") or raw.get("traits") or {},
+    }
+
+    legacy_traits = {
+        "honestidade": "honesty",
+        "dissimulacao": "deceit",
+        "empatia": "empathy",
+        "coragem": "courage",
+        "agressividade": "aggressiveness",
+        "ganancia": "greed",
+    }
+    traits = {}
+    for old_key, new_key in legacy_traits.items():
+        if old_key in data["traits"]:
+            traits[new_key] = data["traits"][old_key]
+    for key, value in data["traits"].items():
+        if key in DEFAULT_TRAITS:
+            traits[key] = value
+    data["traits"] = {**DEFAULT_TRAITS, **traits}
+    return data
+
 
 def create_actor(path, name, description, examples, traits):
     """Cria o arquivo .db de um ator novo, já com a personalidade gravada."""
@@ -211,12 +333,6 @@ def create_actor(path, name, description, examples, traits):
 # ============================================================================
 # 3) FUNÇÕES AUXILIARES
 # ============================================================================
-
-def sigmoid(x):
-    """Transforma qualquer número em uma probabilidade entre 0 e 1."""
-    x = max(-30.0, min(30.0, x))
-    return 1 / (1 + math.exp(-x))
-
 
 def clamp(value, minimum=0.0, maximum=1.0):
     return max(minimum, min(maximum, value))
@@ -290,36 +406,6 @@ def detect_subject(text, names):
 
 
 # ============================================================================
-# 3b) MEMÓRIA SEMÂNTICA: vetores de embedding (roadmap, seção 8)
-# ============================================================================
-# Guardados como BLOB (array de floats, sem depender de numpy) em vez de JSON: mais compacto
-# e sem custo de parsing de texto a cada leitura.
-
-def _serialize_vector(vector):
-    return array.array("f", vector).tobytes()
-
-
-def _deserialize_vector(blob):
-    vector = array.array("f")
-    vector.frombytes(blob)
-    return vector.tolist()
-
-
-def _cosine_similarity(a, b):
-    """Similaridade de cosseno entre dois vetores (1 = mesma direção, 0 = ortogonais). Puro
-    Python de propósito: os vetores são poucos por Ator, não vale a pena depender de numpy."""
-    n = min(len(a), len(b))
-    if n == 0:
-        return 0.0
-    dot = sum(a[i] * b[i] for i in range(n))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-# ============================================================================
 # 4) O ATOR
 # ============================================================================
 
@@ -328,10 +414,27 @@ class Actor:
         self.path = path
         self.slot = slot  # slot do llama-server reservado a este ator (cache do prefixo)
         self.db = open_database(path)
-        row = self.db.execute("SELECT value FROM config WHERE key='personality'").fetchone()
-        if row is None:
+
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(config)")}
+        if "key" in columns:
+            row = self.db.execute("SELECT value FROM config WHERE key='personality'").fetchone()
+            if row is None:
+                row = self.db.execute("SELECT value FROM config WHERE key='personalidade'").fetchone()
+            if row is None:
+                raise ValueError(f"{path} não tem personalidade. Crie o ator com create_actor().")
+            personality = json.loads(row["value"])
+        elif "chave" in columns:
+            row = self.db.execute("SELECT valor FROM config WHERE chave='personalidade'").fetchone()
+            if row is None:
+                raise ValueError(f"{path} não tem personalidade. Crie o ator com create_actor().")
+            personality = json.loads(row["valor"])
+        else:
             raise ValueError(f"{path} não tem personalidade. Crie o ator com create_actor().")
-        self.personality = json.loads(row["value"])
+
+        self.personality = normalize_personality(personality)
+        self.db.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('personality', ?)",
+                        (json.dumps(self.personality, ensure_ascii=False),))
+        self.db.commit()
         self.name = self.personality["name"]
 
         # Coisas que vivem só na RAM (somem quando o programa fecha):
@@ -345,6 +448,7 @@ class Actor:
         self.debug = False        # modo debug: imprime o painel completo após cada resposta
         self.last_decision = {}   # interlocutor -> dados do último turno (para o painel de debug)
         self._no_embedding = False  # True assim que o servidor recusar embeddings 1x (ver _recall_best)
+        self._embedding_cache = {}  # texto -> vetor para evitar repetir o mesmo embedding na mesma sessão
         self.interrogation_counts = {}  # candidato -> quantas vezes já foi escolhido como alvo
 
     def _log(self, message):
@@ -411,13 +515,11 @@ class Actor:
         """
         Como recall(), mas por SIGNIFICADO em vez de palavra em comum: usa o embedding do
         próprio LLM (LLM.embedding em llm.py) - o mesmo servidor de sempre, sem modelo nem
-        dependência extra (roadmap, seção 8). Pega paráfrases que recall() não pegaria (ex.:
-        "perto do cofre" e "saindo do escritório" podem ficar próximos no espaço de embeddings
-        mesmo sem nenhuma palavra igual).
+        dependência extra (roadmap, seção 8). Pega paráfrases que recall() não pegaria.
 
-        Embeddings de cada memória são calculados PREGUIÇOSAMENTE (só na primeira vez que ela
-        entra numa busca semântica) e ficam salvos no `.db` - buscas seguintes gastam UMA
-        chamada ao LLM (a da consulta), não uma por memória.
+        Ajuste de performance: cacheia vetores por texto na RAM do Ator e grava em lote os
+        embeddings novos em uma única operação no SQLite, em vez de um UPDATE por memória
+        dentro do laço. Isso reduz chamadas redundantes ao LLM e volume de escrita no banco.
 
         Levanta RuntimeError se o servidor não tiver o endpoint de embedding (não foi iniciado
         com --embeddings). Quem chama decide o que fazer - ver `_recall_best`, que cai para
@@ -429,18 +531,29 @@ class Actor:
             return []
 
         query_vector = llm.embedding(query)
+        pending_updates = []
 
         scored = []
         for memory in candidates:
-            if memory["embedding"] is None:
-                vector = llm.embedding(memory["text"])
-                self.db.execute("UPDATE memories SET embedding=? WHERE id=?",
-                                (_serialize_vector(vector), memory["id"]))
-                self.db.commit()
-            else:
-                vector = _deserialize_vector(memory["embedding"])
+            text = memory["text"]
+            vector = self._embedding_cache.get(text)
+            if vector is None:
+                if memory["embedding"] is not None:
+                    vector = _deserialize_vector(memory["embedding"])
+                else:
+                    vector = llm.embedding(text)
+                    pending_updates.append((memory["id"], _serialize_vector(vector)))
+                self._embedding_cache[text] = vector
+
             similarity = _cosine_similarity(query_vector, vector)
             scored.append((similarity, memory["timestamp"], memory))
+
+        if pending_updates:
+            self.db.executemany(
+                "UPDATE memories SET embedding=? WHERE id=?",
+                [(blob, memory_id) for memory_id, blob in pending_updates],
+            )
+            self.db.commit()
 
         scored.sort(key=lambda c: (c[0], c[1]), reverse=True)
         return [c[2] for c in scored[:k]]
@@ -534,28 +647,14 @@ class Actor:
 
     def belief(self, proposition):
         """Devolve a crença (dict) para uma proposição exata, ou None se não existir ainda."""
-        row = self.db.execute("SELECT * FROM beliefs WHERE proposition=?",
-                              (proposition.strip(),)).fetchone()
-        if row is None:
-            return None
-        d = dict(row)
-        d["evidence"] = json.loads(d["evidence"] or "[]")
-        return d
+        return belief_state.belief(self, proposition)
 
     def form_belief(self, proposition, confidence=0.5, origin=None, subject=None, evidence=None):
         """Cria a crença se a proposição ainda não existir (não duplica). Devolve a crença atual."""
-        proposition = proposition.strip()
-        existing = self.belief(proposition)
-        if existing:
-            return existing
-        now = time.time()
-        self.db.execute(
-            "INSERT INTO beliefs(proposition, subject, confidence, origin, evidence, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (proposition, subject, clamp(confidence), origin,
-             json.dumps([evidence] if evidence else []), now, now))
-        self.db.commit()
-        return self.belief(proposition)
+        return belief_state.form_belief(
+            self, proposition, confidence=confidence, origin=origin,
+            subject=subject, evidence=evidence,
+        )
 
     def update_belief(self, proposition, delta, origin=None, subject=None, evidence=None):
         """
@@ -568,41 +667,17 @@ class Actor:
         sempre os mesmos registros do world.db), inflando a confiança rápido demais só por
         perguntar de novo, não por haver algo novo.
         """
-        c = self.form_belief(proposition, confidence=0.5, origin=origin, subject=subject)
-        evidence_list = c["evidence"]
-        if evidence is not None and evidence in evidence_list:
-            return c
-        new_confidence = clamp(c["confidence"] + delta)
-        if evidence is not None:
-            evidence_list.append(evidence)
-        self.db.execute(
-            "UPDATE beliefs SET confidence=?, origin=?, subject=?, evidence=?, updated_at=? "
-            "WHERE proposition=?",
-            (new_confidence, origin or c["origin"], subject or c["subject"],
-             json.dumps(evidence_list), time.time(), proposition.strip()))
-        self.db.commit()
-        return self.belief(proposition)
+        return belief_state.update_belief(
+            self, proposition, delta, origin=origin, subject=subject, evidence=evidence,
+        )
 
     def beliefs_about(self, subject, k=5):
         """Crenças cujo assunto é `subject`, da mais para a menos confiante (ex.: hipóteses de
         um investigador sobre um suspeito específico)."""
-        rows = self.db.execute(
-            "SELECT * FROM beliefs WHERE subject=? ORDER BY confidence DESC LIMIT ?", (subject, k))
-        result = []
-        for row in rows:
-            d = dict(row)
-            d["evidence"] = json.loads(d["evidence"] or "[]")
-            result.append(d)
-        return result
+        return belief_state.beliefs_about(self, subject, k=k)
 
     def list_beliefs(self, k=10):
-        rows = self.db.execute("SELECT * FROM beliefs ORDER BY confidence DESC LIMIT ?", (k,))
-        result = []
-        for row in rows:
-            d = dict(row)
-            d["evidence"] = json.loads(d["evidence"] or "[]")
-            result.append(d)
-        return result
+        return belief_state.list_beliefs(self, k=k)
 
     # ------------------------------------------------------------------
     # 4.1c) OBJETIVOS: metas com prioridade/progresso/risco (roadmap, seção 17)
@@ -656,41 +731,20 @@ class Actor:
     def state(self, key):
         """Valor atual (0 a 1). Guardamos valor + hora da última mudança e calculamos aqui
         quanto ele já esmaeceu: valor * 0.5 ** (tempo_passado / meia_vida)."""
-        row = self.db.execute("SELECT value, updated_at FROM state WHERE key=?",
-                              (key,)).fetchone()
-        if row is None:
-            return 0.0
-        return row["value"] * 0.5 ** ((time.time() - row["updated_at"]) / HALF_LIFE[key])
+        return emotional_state.state(self, key)
 
     def change_state(self, key, delta):
-        new_value = clamp(self.state(key) + delta)
-        self.db.execute(
-            "INSERT INTO state(key, value, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, new_value, time.time()))
-        self.db.commit()
+        emotional_state.change_state(self, key, delta)
 
     # ------------------------------------------------------------------
     # 4.3) RELAÇÕES: o que sinto por cada outro ator
     # ------------------------------------------------------------------
 
     def relationship(self, other):
-        self.db.execute("INSERT OR IGNORE INTO relationships(other, updated_at) VALUES (?, ?)",
-                        (other, time.time()))
-        r = dict(self.db.execute("SELECT * FROM relationships WHERE other=?", (other,)).fetchone())
-        # O medo esmaece com o tempo, como as outras emoções.
-        r["fear"] *= 0.5 ** ((time.time() - r["updated_at"]) / HALF_LIFE["fear"])
-        return r
+        return social_state.relationship(self, other)
 
     def change_relationship(self, other, **deltas):
-        r = self.relationship(other)
-        for field, delta in deltas.items():
-            r[field] = clamp(r[field] + delta)
-        self.db.execute(
-            "UPDATE relationships SET trust=?, fear=?, distrust=?, favor_owed=?, "
-            "updated_at=? WHERE other=?",
-            (r["trust"], r["fear"], r["distrust"], r["favor_owed"], time.time(), other))
-        self.db.commit()
+        social_state.change_relationship(self, other, **deltas)
 
     # ------------------------------------------------------------------
     # 4.4) DECISÕES (o coração do comportamento) - tudo em código, sem LLM
@@ -703,9 +757,7 @@ class Actor:
         já que `relationship()` cria essa linha para todo participante presente no início da
         cena (ver cmd_scene em main.py). Sem candidato, DEFLECT simplesmente não é oferecido.
         """
-        candidates = [row["other"] for row in
-                     self.db.execute("SELECT other FROM relationships WHERE other != ?", (other,))]
-        return random.choice(candidates) if candidates else None
+        return action_policy.choose_scapegoat(self, other)
 
     def choose_action(self, fact, other):
         """
@@ -720,65 +772,7 @@ class Actor:
           decision = REVEAL | HIDE | LIE | DEFLECT
           extra    = None, exceto para DEFLECT, onde é {"fake_target": nome}
         """
-        t = self.personality["traits"]
-        rel = self.relationship(other)
-        guilt = self.state("guilt")
-
-        wants_to_reveal = (
-            2.0 * rel["trust"]                          # confio em quem pergunta
-            + 1.5 * t["honesty"]                         # sou honesto
-            + 1.0 * guilt                                # estou com a consciência pesada
-            + 3.0 * rel["fear"] * (1 - t["courage"])     # tenho medo dele (e pouca coragem)
-            + 0.8 * rel["favor_owed"]                    # devo um favor a ele
-            - 2.5 * fact["sensitivity"]                  # o fato é delicado
-            - 1.0 * rel["distrust"]                      # desconfio dele
-        )
-        reveal_chance = sigmoid(wants_to_reveal)
-
-        # POSTURA PERSISTENTE: se eu já decidi esconder/mentir/desviar sobre este fato nesta
-        # conversa, mantenho a decisão enquanto nada mudar de verdade. Sem isso, sortear de novo
-        # a cada fala faria qualquer um acabar contando (é só esperar o sorteio). Ameaça, culpa
-        # ou confiança que mexem no placar em 0.5 ou mais fazem o ator reconsiderar - mas isso
-        # sozinho podia travar o jogo: contra um investigador manso (que nunca ameaça o
-        # suficiente para mexer o placar), o placar nunca sobe 0.5 de uma vez, então a postura
-        # nunca era reconsiderada, nem depois de 15 rodadas de pressão. STANCE_PERSISTENCE limita
-        # quantas vezes seguidas a mesma postura pode se repetir "de graça": depois disso, mesmo
-        # sem uma virada brusca, o personagem é forçado a sortear de novo - a pressão repetida
-        # (o placar subindo aos poucos) volta a valer alguma coisa em vez de ser só decoração no
-        # log.
-        key = (other, fact["id"])
-        previous = self.stances.get(key)
-        if previous:
-            prev_decision, prev_score, prev_extra, attempts = previous
-            if abs(wants_to_reveal - prev_score) < 0.5 and attempts < STANCE_PERSISTENCE:
-                self.stances[key] = (prev_decision, prev_score, prev_extra, attempts + 1)
-                return prev_decision, prev_extra, reveal_chance
-
-        if random.random() < reveal_chance:
-            decision, extra = "REVEAL", None
-        else:
-            # Não vou contar a verdade: minto, escondo ou desvio a suspeita? DEFLECT só entra em
-            # jogo se um objetivo concreto justificar o risco (não é personalidade sozinha).
-            goal = self.main_goal()
-            risks_deflecting = (
-                goal is not None and goal["priority"] >= 0.7
-                and t["deceit"] >= 0.6 and t["empathy"] < 0.5
-                and fact["sensitivity"] >= 0.7
-            )
-            fake_target = self._choose_scapegoat(other) if risks_deflecting else None
-            if fake_target:
-                decision, extra = "DEFLECT", {"fake_target": fake_target}
-            else:
-                # Mentir exige dissimulação, pouca honestidade e pouca culpa, e só vale a pena
-                # para fatos sensíveis.
-                lie_chance = (t["deceit"] * (1 - t["honesty"])
-                              * (1 - 0.7 * guilt) * fact["sensitivity"])
-                if fact["false_version"] and random.random() < lie_chance:
-                    decision, extra = "LIE", None
-                else:
-                    decision, extra = "HIDE", None
-        self.stances[key] = (decision, wants_to_reveal, extra, 0)
-        return decision, extra, reveal_chance
+        return action_policy.choose_action(self, fact, other)
 
     def choose_tactic(self, other):
         """
@@ -789,25 +783,12 @@ class Actor:
           gentil quase nunca ameaça, mesmo frustrado; quem é agressivo escala rápido.
         - Confiar no outro reduz a chance.
         """
-        t = self.personality["traits"]
-        disposition = 2.0 * t["aggressiveness"] + 1.0 * t["greed"] + 1.5 * (1 - t["empathy"])
-        threat_chance = sigmoid(
-            disposition * (1 + 1.4 * self.state("frustration"))
-            - 2.0 * self.relationship(other)["trust"]
-            - 5.7
-        )
-        tactic = "THREATEN" if random.random() < threat_chance else "ASK"
-        self._log(f"{self.name} escolheu a tatica {tactic} (chance de ameacar: {threat_chance:.0%})")
-        return tactic
+        return action_policy.choose_tactic(self, other)
 
     @staticmethod
     def tactic_instruction(tactic, other, topic):
         """Traduz a tática escolhida pelo código em uma instrução para o LLM."""
-        if tactic == "THREATEN":
-            return (f'Ameace {other} (dentro do jogo: parar de confiar, cortar a troca de '
-                    f'informações, contar aos outros que esconde coisas) para que conte o que '
-                    f'sabe sobre "{topic}".')
-        return f'Pergunte a {other} o que sabe sobre "{topic}".'
+        return action_policy.tactic_instruction(tactic, other, topic)
 
     def _suspicion_score(self, candidate):
         """
@@ -821,15 +802,7 @@ class Actor:
         choose_investigation_target) quanto de fallback caso ele não responda nada
         aproveitável.
         """
-        belief = self.belief(f"{candidate} é o culpado")
-        suspicion = belief["confidence"] if belief else 0.0
-        fatigue = self.interrogation_counts.get(candidate, 0)
-        return (
-            0.6 * suspicion
-            + 0.4 * self.relationship(candidate)["distrust"]
-            + (0.3 if candidate not in self.satisfied else 0.0)
-            - INTERROGATION_FATIGUE * fatigue
-        )
+        return action_policy.suspicion_score(self, candidate)
 
     def choose_investigation_target(self, candidates, topic, llm):
         """
@@ -845,32 +818,7 @@ class Actor:
         ainda não é resumido em lugar nenhum. Dar ao LLM o teor das falas já trocadas (não só os
         números) é uma extensão futura natural.
         """
-        scores = {c: self._suspicion_score(c) for c in candidates}
-        ranking = "\n".join(
-            f"- {name}: suspeita {scores[name]:.2f}" + (" (já interrogado)" if name in self.satisfied else "")
-            for name in sorted(candidates, key=lambda c: -scores[c])
-        )
-        request = [
-            {"role": "system", "content": (
-                "Você é um investigador decidindo quem interrogar a seguir numa investigação. "
-                "Responda SOMENTE com o nome exato de uma pessoa da lista, sem mais nada.")},
-            {"role": "user", "content": (
-                f"Objetivo da investigação: {topic}\n\n"
-                f"Suspeitos e o quanto você já suspeita de cada um (0 a 1):\n{ranking}\n\n"
-                "Quem você vai interrogar agora? Responda só com o nome.")},
-        ]
-        answer = llm.generate(request, max_tokens=20, temperature=0.3) or ""
-        chosen = detect_subject(answer, candidates)
-        if not chosen:
-            # Resposta do LLM não deu pra usar (vazia, ambígua, fora da lista): o código decide
-            # sozinho pela pontuação, com um empate mínimo quebrado ao acaso.
-            chosen = max(candidates, key=lambda c: scores[c] + random.uniform(0.0, 0.01))
-            self._log(f"{self.name} (fallback do código) decide interrogar {chosen}.")
-        else:
-            self._log(f"{self.name} (LLM) decide interrogar {chosen}.")
-
-        self.interrogation_counts[chosen] = self.interrogation_counts.get(chosen, 0) + 1
-        return chosen
+        return action_policy.choose_investigation_target(self, candidates, topic, llm, detect_subject)
 
     # ------------------------------------------------------------------
     # 4.5) PROMPTS: como a fala vira texto para o LLM
@@ -977,6 +925,33 @@ class Actor:
         self.waiting = True
         return {"from": self.name, "target": other, "tactic": tactic, "text": text, "facts": []}
 
+    def open_influence_conversation(self, other, topic, suspect, llm, weight=0.25):
+        """Inicia um diálogo privado tentando plantar uma suspeita sem alegá-la como prova."""
+        proposition = f"{suspect} pode estar envolvido em {topic}."
+        instruction = (
+            f'Comece uma conversa privada com {other}. Tente convencê-lo de que {suspect} '
+            f'pode estar envolvido em "{topic}". Apresente como suspeita, não como fato provado. '
+            f'Diga claramente: "{proposition}" Não revele seu próprio envolvimento.'
+        )
+        text = self._speak(self._messages(other, instruction), llm)
+        if not verbalized(proposition, text):
+            reinforced = (
+                instruction + f'\nDiga explicitamente esta suspeita: "{proposition}"'
+            )
+            text = self._speak(self._messages(other, reinforced), llm)
+        accusations = ([{"subject": suspect, "proposition": proposition, "weight": weight}]
+                       if verbalized(proposition, text) else [])
+        self._save_history(other, f"(Você começa uma conversa privada com {other}.)", text)
+        self.waiting = False
+        return {
+            "from": self.name,
+            "target": other,
+            "tactic": "NONE",
+            "text": text,
+            "facts": [],
+            "accusations": accusations,
+        }
+
     def receive(self, env):
         """Efeitos de ouvir uma fala do outro. Só código: nenhuma chamada ao LLM."""
         other = env["from"]
@@ -1008,7 +983,10 @@ class Actor:
                     "SELECT * FROM memories WHERE origin=? AND source_id=? AND text!=? "
                     "ORDER BY id DESC LIMIT 1", (other, source_id, text)).fetchone()
 
-            memory_id = self.remember(text, origin=other, sensitivity=0.5, source_id=source_id)
+            memory_id = self.remember(
+                text, origin=other, sensitivity=0.5, source_id=source_id,
+                about=fact.get("subject"),
+            )
 
             if previous is not None:
                 self.db.execute("UPDATE memories SET contradictory=1 WHERE id IN (?, ?)",
@@ -1031,6 +1009,11 @@ class Actor:
             weight = acc.get("weight", 0.15)
             self.update_belief(f"{acc['subject']} é o culpado", delta=weight, origin=other,
                                subject=acc["subject"], evidence=f"accusation:{other}")
+            proposition = acc.get("proposition", f"{acc['subject']} pode estar envolvido.")
+            self.remember(
+                f"{other} disse: {proposition}", origin=other, sensitivity=0.4,
+                shareable=1, about=acc["subject"],
+            )
             self._log(f"{self.name} ouviu {other} insinuar que {acc['subject']} pode estar envolvido")
 
         # (c) Se eu tinha pedido algo (e sou o alvo da resposta): vieram fatos? Sem informação, a
@@ -1081,14 +1064,16 @@ class Actor:
             debug_decisions.append((fact["text"], decision, p))
             if decision == "REVEAL":
                 outgoing_facts.append({"text": fact["text"], "source_id": fact["id"],
-                                       "origin": fact["origin"], "kind": "REVEAL"})
+                                       "origin": fact["origin"], "subject": fact["about"],
+                                       "kind": "REVEAL"})
                 self.disclosed.add((other, fact["id"]))
             elif decision == "LIE":
                 # O prompt recebe SÓ a versão falsa: a verdade não entra nele. source_id é o
                 # MESMO da verdade (é o mesmo fato-base) - se este Ator revelar a verdade sobre
                 # ele depois, quem ouviu as duas versões pega a contradição (ver receive()).
                 outgoing_facts.append({"text": fact["false_version"], "source_id": fact["id"],
-                                       "origin": fact["origin"], "kind": "LIE"})
+                                       "origin": fact["origin"], "subject": fact["about"],
+                                       "kind": "LIE"})
                 self.change_state("guilt", 0.1 + 0.4 * self.personality["traits"]["empathy"])  # empatia = mais culpa
             elif decision == "DEFLECT":
                 fake_target = extra["fake_target"]

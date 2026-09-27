@@ -5,7 +5,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from names import FIRST_NAMES, LAST_NAMES, draw_names
+from contracenador.agents.personality import FIRST_NAMES, LAST_NAMES, draw_names, generate_personality_profile
+from contracenador.scenarios.generator import generate_world_seed
 
 
 class TestDrawNames(unittest.TestCase):
@@ -31,6 +32,26 @@ class TestDrawNames(unittest.TestCase):
             self.assertEqual(len(parts), 2)
             self.assertIn(parts[0], FIRST_NAMES)
             self.assertIn(parts[1], LAST_NAMES)
+
+
+class TestGeneratedRoleProfiles(unittest.TestCase):
+
+    def test_generate_personality_profile_uses_code_defaults(self):
+        profile = generate_personality_profile("guilty", name="Ana Silva", theme="joia roubada")
+        self.assertEqual(profile["name"], "Ana Silva")
+        self.assertIn("job", profile)
+        self.assertIn("traits", profile)
+        self.assertIn("speech", profile)
+        self.assertGreater(profile["traits"]["deceit"], 0.55)
+        self.assertIn(profile["job"], {"Joalheiro", "Caixeiro", "Contador", "Chaveiro", "Empresário"})
+
+    def test_generate_world_seed_creates_structured_story_layout(self):
+        seed = generate_world_seed("joia roubada em um hotel antigo")
+        self.assertIn("location", seed)
+        self.assertIn("conflict", seed)
+        self.assertIn("jobs", seed)
+        self.assertTrue(seed["jobs"])
+        self.assertIn("tension", seed)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from world import (evidence_by_origin, evidence_for_event, event_truth, find_event_by_type,
-                   open_world, position, register_evidence, register_event, register_location)
+from contracenador.world import (
+    evidence_by_origin, evidence_for_event, event_truth, find_event_by_type,
+    open_world, position, register_evidence, register_event, register_location,
+)
 
 
 class TestWorld(unittest.TestCase):
