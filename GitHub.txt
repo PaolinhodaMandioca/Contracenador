@@ -1,0 +1,1524 @@
+GitHub
+
+Analisei o repositório atual do **Contracenador**, incluindo `Ator.py`, `main.py`, `llm.py`, `roteirista.py` e o fluxo de criação/materialização das cenas. A ideia é **bem mais interessante do que simplesmente colocar dois LLMs para conversar**: você já criou uma espécie de **motor de simulação multiagente**, onde o LLM cuida da linguagem e o código mantém estado, memória, relações e decisões. ([GitHub][1])
+
+E eu acho que dá para levar isso **muito mais longe**.
+
+---
+
+# 1. O que você já tem
+
+Hoje a arquitetura é aproximadamente:
+
+```text
+                    ┌─────────────────┐
+                    │   Roteirista    │
+                    │      LLM        │
+                    └────────┬────────┘
+                             │
+                       cria cenário
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+          personagem                    personagem
+              │                             │
+           SQLite                        SQLite
+              │                             │
+        personalidade                 personalidade
+        memória                       memória
+        emoções                       emoções
+        relações                      relações
+              │                             │
+              └──────────┬──────────────────┘
+                         │
+                    llama-server
+                         │
+                       LLM 7B
+```
+
+O ponto que mais gostei é esta decisão arquitetural:
+
+> **o LLM não decide diretamente o estado do personagem.**
+
+`decidir()` determina `REVELAR`, `ESCONDER` ou `MENTIR`, enquanto o LLM recebe uma instrução já determinada e apenas transforma isso em fala. 
+
+Isso é excelente para um sistema local porque você não precisa gastar tokens tentando fazer o modelo "pensar" em tudo.
+
+---
+
+# 2. A maior evolução que eu faria
+
+Eu transformaria o projeto de:
+
+```text
+DOIS ATORES CONVERSANDO
+```
+
+para:
+
+```text
+SIMULADOR DE MUNDO MULTIAGENTE
+```
+
+Essa diferença parece pequena, mas muda completamente o potencial do projeto.
+
+Hoje:
+
+```text
+Ator A
+   ↕
+Ator B
+```
+
+Eu faria:
+
+```text
+                         ┌─────────────┐
+                         │    MUNDO     │
+                         │             │
+                         │ eventos     │
+                         │ localização │
+                         │ objetos      │
+                         │ tempo       │
+                         │ evidências   │
+                         └──────┬──────┘
+                                │
+             ┌──────────────────┼──────────────────┐
+             │                  │                  │
+             ▼                  ▼                  ▼
+          Ator A             Ator B             Ator C
+             │                  │                  │
+          memória            memória            memória
+          crenças            crenças            crenças
+          emoções            emoções            emoções
+          relações           relações           relações
+          objetivos          objetivos          objetivos
+```
+
+Aí o projeto deixa de ser apenas um experimento de personagens e passa a ser uma **engine de agentes autônomos**.
+
+---
+
+# 3. Criaria um `WorldState`
+
+Atualmente boa parte da realidade da história está distribuída entre `cena.json`, memórias e atributos dos personagens. 
+
+Eu criaria:
+
+```text
+world/
+    state.db
+    events.db
+    evidence.db
+```
+
+Com coisas como:
+
+```text
+World
+ ├── tempo
+ ├── localização
+ ├── objetos
+ ├── eventos
+ ├── personagens
+ ├── evidências
+ └── regras
+```
+
+Exemplo:
+
+```json
+{
+  "evento": "copo_quebrado",
+  "hora": "21:43",
+  "local": "sala_de_jantar",
+  "objeto": "copo_azul",
+  "estado": "quebrado"
+}
+```
+
+Então o mundo tem uma **verdade objetiva**.
+
+Os personagens não necessariamente conhecem essa verdade.
+
+---
+
+# 4. A diferença entre "verdade" e "crença"
+
+Essa seria uma das maiores melhorias.
+
+Hoje existe essencialmente:
+
+```text
+memoria = fato que o personagem sabe
+```
+
+Eu adicionaria:
+
+```text
+WORLD FACT
+     │
+     ├── verdade objetiva
+     │
+     ├── observação
+     │
+     └── interpretação
+```
+
+Por exemplo:
+
+### Mundo
+
+```text
+João pegou a faca às 21:30.
+```
+
+### Maria viu
+
+```text
+Maria:
+"Vi João perto da cozinha."
+```
+
+### Maria acredita
+
+```text
+Maria:
+"João provavelmente pegou a faca."
+```
+
+### João sabe
+
+```text
+João:
+"Eu peguei a faca."
+```
+
+### Carlos acredita
+
+```text
+Carlos:
+"Maria está mentindo."
+```
+
+Isso cria uma coisa muito poderosa:
+
+## crenças incorretas.
+
+E aí os agentes realmente começam a parecer diferentes.
+
+---
+
+# 5. Sistema de crenças
+
+Eu adicionaria à tabela:
+
+```sql
+CREATE TABLE crencas (
+    id INTEGER PRIMARY KEY,
+    assunto TEXT,
+    proposicao TEXT,
+    confianca REAL,
+    origem TEXT,
+    evidencias TEXT,
+    atualizado_em REAL
+);
+```
+
+Por exemplo:
+
+```text
+Carlos acredita:
+
+"João roubou o dinheiro"
+confiança: 0.73
+
+origem:
+Maria
+
+evidências:
+- Maria disse que viu João
+- João estava perto do cofre
+```
+
+Mas pode estar errado.
+
+Isso permite:
+
+```text
+verdade ≠ crença
+```
+
+E isso é ouro para o seu projeto.
+
+---
+
+# 6. Evidências como objetos de primeira classe
+
+Atualmente fatos são essencialmente strings armazenadas em memória. 
+
+Eu transformaria evidência em entidade.
+
+```text
+Evidence #42
+
+tipo: testemunho
+conteúdo: "Vi João entrando na cozinha"
+confiabilidade: 0.72
+origem: Maria
+hora: 21:35
+local: cozinha
+```
+
+Depois:
+
+```text
+João roubou o dinheiro
+       │
+       ├── evidência #42
+       │      └── Maria
+       │
+       ├── evidência #51
+       │      └── câmera
+       │
+       └── evidência #63
+              └── impressão digital
+```
+
+Você praticamente cria um **grafo de investigação**.
+
+---
+
+# 7. Contradições
+
+Essa é uma das melhorias que eu considero **obrigatória**.
+
+O próprio README atual já identifica que contradições não são detectadas. ([GitHub][1])
+
+Imagine:
+
+```text
+Maria:
+"João estava na cozinha."
+
+Depois:
+
+Maria:
+"João estava no jardim."
+```
+
+O sistema deveria detectar:
+
+```text
+⚠ CONTRADIÇÃO
+
+Maria afirmou:
+
+21:30 → João estava na cozinha
+21:30 → João estava no jardim
+
+confiança da memória:
+0.82
+
+desconfiança de Maria:
++0.25
+```
+
+E isso poderia alterar:
+
+```text
+confiança
+desconfiança
+agressividade
+probabilidade de acreditar
+probabilidade de investigar
+```
+
+---
+
+# 8. Memória semântica
+
+Hoje sua busca é baseada em palavras compartilhadas e até corta palavras em 5 caracteres. É barata, mas limitada. O próprio projeto já aponta FTS5/embeddings como próximo passo. 
+
+Eu faria:
+
+```text
+                    memória
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+          FTS5                 vetor
+             │                   │
+       busca exata         busca semântica
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                 reranking
+                       ▼
+                  top K fatos
+```
+
+E nem precisa usar um LLM para isso.
+
+Pode usar:
+
+* SQLite FTS5
+* `sqlite-vec`
+* `fastembed`
+* embeddings pequenos
+
+Isso permite:
+
+```text
+Pergunta:
+"Quem estava perto do cofre?"
+
+Memória:
+"Eu vi Carlos saindo da sala onde ficava o cofre."
+
+→ relevante
+```
+
+mesmo sem compartilhar exatamente as mesmas palavras.
+
+---
+
+# 9. Memória episódica
+
+Outra coisa que falta.
+
+Hoje você tem fatos.
+
+Eu adicionaria:
+
+```text
+MEMÓRIA SEMÂNTICA
+"O cofre fica atrás do quadro."
+
+MEMÓRIA EPISÓDICA
+"Ontem às 21:30, Carlos me perguntou sobre o cofre."
+
+MEMÓRIA SOCIAL
+"Maria mentiu para mim duas vezes."
+
+MEMÓRIA EMOCIONAL
+"Quando João me ameaçou, fiquei com medo."
+
+MEMÓRIA PROCEDURAL
+"Quando alguém ameaça, procuro ajuda."
+```
+
+Isso permitiria personalidades muito mais interessantes.
+
+---
+
+# 10. Objetivos individuais
+
+Atualmente o investigador possui um objetivo, mas eu generalizaria isso para **todos os agentes**. O roteirista já gera um objetivo para o investigador e características para os personagens. 
+
+Cada agente poderia ter:
+
+```text
+objetivos:
+
+1. descobrir quem roubou o dinheiro
+2. proteger Maria
+3. esconder que estava na cozinha
+4. recuperar o dinheiro
+5. evitar ser acusado
+```
+
+Cada objetivo teria:
+
+```text
+prioridade
+progresso
+urgência
+risco
+```
+
+Exemplo:
+
+```text
+João
+
+OBJETIVO:
+Não ser descoberto
+
+prioridade: 0.95
+
+SUBOBJETIVOS:
+
+[✓] criar álibi
+[✓] convencer Maria
+[ ] eliminar suspeita de Carlos
+[ ] descobrir o que investigador sabe
+```
+
+Agora o personagem passa a **agir para atingir objetivos**, e não apenas responder.
+
+---
+
+# 11. Sistema de ações
+
+Essa é provavelmente a evolução mais importante depois do WorldState.
+
+Em vez de:
+
+```text
+fala → resposta
+```
+
+ter:
+
+```text
+perceber
+   ↓
+avaliar situação
+   ↓
+objetivos
+   ↓
+ações possíveis
+   ↓
+selecionar ação
+   ↓
+executar
+   ↓
+mudar mundo
+```
+
+Exemplo:
+
+```text
+João percebe:
+
+Carlos está desconfiado.
+
+ações:
+
+[1] mentir
+[2] ameaçar
+[3] fugir
+[4] incriminar Maria
+[5] ficar calado
+[6] mudar assunto
+```
+
+O seu `decidir()` atual poderia evoluir para algo muito mais geral:
+
+```python
+acao = agente.escolher_acao(
+    situacao,
+    objetivos,
+    crencas,
+    personalidade,
+    relacoes
+)
+```
+
+---
+
+# 12. E aqui entra o LLM de verdade
+
+Eu manteria sua filosofia:
+
+### Código
+
+Responsável por:
+
+```text
+estado
+memória
+verdade
+relações
+probabilidades
+regras
+objetivos
+ações possíveis
+segurança
+```
+
+### LLM
+
+Responsável por:
+
+```text
+linguagem
+interpretação
+personalidade verbal
+diálogo
+criatividade
+descrição
+```
+
+Mas adicionaria uma terceira função:
+
+### LLM como planejador
+
+```text
+Código
+ ↓
+ações possíveis
+ ↓
+LLM
+ ↓
+escolhe/ordena plano
+ ↓
+Código valida
+ ↓
+executa
+```
+
+O LLM **não pode modificar diretamente o mundo**.
+
+Ele pede:
+
+```json
+{
+  "acao": "ACUSAR",
+  "alvo": "Maria",
+  "motivo": "contradição entre depoimentos"
+}
+```
+
+O código decide se isso é permitido.
+
+---
+
+# 13. Sistema de percepção
+
+Outra coisa que faria uma diferença absurda.
+
+Hoje, se um fato está na memória, ele praticamente está disponível.
+
+Eu criaria:
+
+```text
+WORLD
+  │
+  ▼
+PERCEPÇÃO DO AGENTE
+  │
+  ├── o que ele viu
+  ├── o que ouviu
+  ├── o que interpretou
+  └── o que ignorou
+```
+
+Com:
+
+```text
+atenção
+visibilidade
+distância
+ruído
+memória
+estado emocional
+```
+
+Exemplo:
+
+```text
+Evento:
+João pegou uma chave.
+
+Maria:
+distância = 15m
+visibilidade = 0.4
+atenção = 0.7
+
+Resultado:
+"Maria viu alguém pegar alguma coisa."
+
+Não:
+
+"Maria sabe que João pegou a chave."
+```
+
+Isso acabaria com vários comportamentos artificiais.
+
+---
+
+# 14. Informação parcial
+
+Eu iria ainda além:
+
+```text
+Agente A
+não sabe que B sabe X
+
+B sabe que A não sabe X
+
+C acredita que A sabe X
+```
+
+Isso cria **informação de segunda ordem**.
+
+Exemplo:
+
+```text
+João sabe que roubou.
+
+Maria viu João.
+
+Carlos viu Maria vendo João.
+
+João não sabe que Carlos viu Maria.
+```
+
+Agora você tem:
+
+```text
+A sabe X
+B sabe X
+C sabe que B sabe X
+A não sabe que C sabe X
+```
+
+Isso pode produzir situações MUITO interessantes.
+
+---
+
+# 15. Relações deveriam ser mais complexas
+
+Hoje você já possui:
+
+```text
+confiança
+medo
+desconfiança
+favor devido
+```
+
+
+
+Eu adicionaria:
+
+```text
+admiração
+ódio
+amizade
+amor
+respeito
+ciúme
+dívida
+rivalidade
+dependência
+medo
+confiança
+```
+
+Mas principalmente:
+
+## histórico da relação
+
+Em vez de:
+
+```text
+confiança = 0.7
+```
+
+ter:
+
+```text
++ Maria me contou a verdade
++ Maria me ajudou
+- Maria mentiu
+- Maria me ameaçou
++ Maria pediu desculpas
+```
+
+E a confiança ser calculada disso.
+
+Assim ela não muda "do nada".
+
+---
+
+# 16. Personalidade mais sofisticada
+
+Seus seis traços atuais são:
+
+```text
+honestidade
+dissimulação
+empatia
+coragem
+agressividade
+ganância
+```
+
+
+
+Eu criaria algo como:
+
+```text
+PERSONALIDADE
+
+Big Five:
+├── abertura
+├── conscienciosidade
+├── extroversão
+├── amabilidade
+└── neuroticismo
+
+SOCIAL
+├── confiança
+├── assertividade
+├── manipulação
+├── empatia
+└── sociabilidade
+
+MORAL
+├── honestidade
+├── lealdade
+├── culpa
+└── escrúpulos
+
+COGNITIVO
+├── curiosidade
+├── cautela
+├── impulsividade
+└── paranoia
+```
+
+Não precisa mandar tudo para o LLM.
+
+O código usa os números para comportamento.
+
+O LLM recebe apenas uma descrição resumida:
+
+```text
+Você é cauteloso, desconfiado e pouco empático.
+Sob pressão tende a responder agressivamente.
+```
+
+---
+
+# 17. Estado emocional mais interessante
+
+Você já tem decaimento temporal para culpa, medo e frustração. Isso é uma ótima ideia. 
+
+Eu faria:
+
+```text
+emoções:
+
+alegria
+tristeza
+raiva
+medo
+ansiedade
+culpa
+vergonha
+frustração
+excitação
+calma
+```
+
+Mas principalmente adicionaria:
+
+```text
+EVENTO → EMOÇÃO
+```
+
+Por exemplo:
+
+```text
+Maria foi ameaçada
+       ↓
+medo +0.35
+confiança -0.10
+raiva +0.20
+```
+
+E não simplesmente:
+
+```python
+medo += 0.5
+```
+
+---
+
+# 18. Sistema de reputação
+
+Imagine que existam 20 agentes.
+
+Então:
+
+```text
+João
+ ├── Maria: confiança 0.8
+ ├── Carlos: confiança 0.2
+ └── Ana: confiança 0.5
+```
+
+Mas existe também:
+
+```text
+REPUTAÇÃO PÚBLICA
+
+João:
+honesto: 0.72
+confiável: 0.61
+agressivo: 0.31
+```
+
+E cada agente pode ter uma percepção diferente:
+
+```text
+Maria acha João confiável: 0.9
+
+Carlos acha João confiável: 0.1
+```
+
+Isso gera política social dentro da simulação.
+
+---
+
+# 19. Um "motor de fofoca"
+
+Isso combina **perfeitamente** com o projeto.
+
+Imagine:
+
+```text
+Maria → Carlos:
+
+"João estava perto do cofre."
+```
+
+Carlos registra:
+
+```text
+origem = Maria
+confiabilidade = 0.73
+```
+
+Depois:
+
+```text
+Carlos → Ana:
+
+"Maria disse que João estava perto do cofre."
+```
+
+Ana registra:
+
+```text
+origem = Carlos
+origem_original = Maria
+```
+
+E depois:
+
+```text
+Ana → João:
+
+"Estão dizendo que você roubou o dinheiro."
+```
+
+Agora você tem **propagação de informação**.
+
+E pode adicionar distorção:
+
+```text
+Maria:
+"João estava perto do cofre."
+
+↓
+
+Carlos:
+"Maria acha que João mexeu no cofre."
+
+↓
+
+Ana:
+"Maria disse que João roubou."
+
+↓
+
+João:
+"Estão dizendo que Maria me acusou de roubo."
+```
+
+Isso seria MUITO legal no Contracenador.
+
+---
+
+# 20. Sistema de testemunhas
+
+Eu transformaria testemunhas em sensores imperfeitos.
+
+Cada personagem poderia ter:
+
+```text
+acuidade_visual
+acuidade_auditiva
+memoria
+atenção
+preconceito
+sugestionabilidade
+```
+
+Então:
+
+```text
+evento
+ ↓
+percepção
+ ↓
+memória
+ ↓
+interpretação
+```
+
+Uma testemunha bêbada, assustada ou distante não teria a mesma informação que outra.
+
+---
+
+# 21. Investigação realmente autônoma
+
+Hoje o investigador escolhe o alvo usando uma heurística baseada principalmente em desconfiança e se já foi interrogado. 
+
+Isso poderia virar:
+
+```text
+INVESTIGADOR
+
+Objetivo:
+descobrir culpado
+
+Conhecimento atual:
+├── evidência A
+├── evidência B
+└── depoimento C
+
+Hipóteses:
+├── João: 42%
+├── Maria: 35%
+├── Carlos: 23%
+
+Próxima ação:
+interrogar Maria
+```
+
+E depois:
+
+```text
+nova evidência
+       ↓
+atualiza hipóteses
+       ↓
+escolhe próxima ação
+```
+
+Isso já começa a parecer um **agente investigador de verdade**.
+
+---
+
+# 22. Hipóteses explícitas
+
+Eu criaria uma tabela:
+
+```sql
+hipoteses
+---------
+id
+agente
+descricao
+probabilidade
+evidencias
+criada_em
+atualizada_em
+```
+
+Exemplo:
+
+```text
+Investigador:
+
+H1:
+"João é culpado"
+probabilidade: 0.64
+
+H2:
+"Maria é culpada"
+probabilidade: 0.21
+
+H3:
+"Foi acidente"
+probabilidade: 0.15
+```
+
+Uma nova evidência altera essas probabilidades.
+
+Isso permitiria um sistema de investigação muito mais convincente.
+
+---
+
+# 23. Um ponto importante do seu código atual
+
+Encontrei uma inconsistência:
+
+O `README.md` ainda descreve o sistema como usando um modelo **3B**, enquanto `main.py` atualmente define **Qwen2.5-7B para os atores e 14B para o roteirista**. ([GitHub][1])
+
+Eu atualizaria isso imediatamente porque quem clonar o projeto pode acabar seguindo instruções erradas.
+
+Além disso, o `main.py` atualmente troca o processo do 7B pelo 14B quando precisa criar o roteiro e depois volta para o 7B. 
+
+Isso funciona, mas existe uma melhoria importante:
+
+```text
+ANTES
+
+7B
+ ↓
+mata
+ ↓
+14B
+ ↓
+mata
+ ↓
+7B
+```
+
+Eu tentaria:
+
+```text
+7B server
+        \
+         \
+          14B server
+```
+
+ou, melhor ainda, dependendo da sua máquina:
+
+```text
+modelo rápido
+      +
+modelo roteirista sob demanda
+```
+
+com um gerenciador de modelos/cache.
+
+---
+
+# 24. Seu maior gargalo futuro
+
+Não acho que será SQLite.
+
+Nem Python.
+
+Nem necessariamente o LLM.
+
+Será:
+
+```text
+NÚMERO DE AGENTES
+        ×
+CONTEXTOS
+        ×
+CHAMADAS AO LLM
+```
+
+Imagine:
+
+```text
+5 agentes
+×
+15 rodadas
+×
+2 falas
+```
+
+Já são muitas inferências.
+
+Agora:
+
+```text
+50 agentes
+×
+100 eventos
+```
+
+explode.
+
+Por isso eu faria desde cedo uma separação:
+
+```text
+             SIMULAÇÃO
+                 │
+       ┌─────────┴─────────┐
+       │                   │
+  motor lógico          motor LLM
+       │                   │
+     rápido             caro
+       │                   │
+       └─────────┬─────────┘
+                 │
+             Scheduler
+```
+
+O scheduler decide:
+
+> "Esse evento realmente precisa de LLM?"
+
+Se não:
+
+```text
+→ código puro
+```
+
+Se sim:
+
+```text
+→ LLM
+```
+
+Isso combina perfeitamente com a arquitetura que você já começou.
+
+---
+
+# 25. E aqui eu usaria aquele conceito que você estava perguntando antes
+
+Você perguntou sobre modelos grandes sendo divididos em pedaços.
+
+Eu não usaria um modelo gigantesco para **cada personagem**.
+
+Eu faria:
+
+```text
+                  CONTRACENADOR
+                       │
+                 Agent Runtime
+                       │
+              ┌────────┴────────┐
+              │                 │
+          decisões           linguagem
+              │                 │
+           código              LLM
+                                 │
+                       ┌─────────┴─────────┐
+                       │                   │
+                 modelo rápido        modelo grande
+                    3B–7B             sob demanda
+```
+
+Modelo pequeno:
+
+```text
+fala normal
+reação
+pergunta
+resposta
+```
+
+Modelo maior:
+
+```text
+planejamento complexo
+contradição
+investigação
+criação de personagem
+criação de cenário
+eventos complexos
+```
+
+Assim você pode ter **dezenas de agentes** sem precisar de dezenas de modelos.
+
+---
+
+# 26. Uma ideia que eu acho MUITO boa para seu projeto
+
+Criaria um **"Cérebro Hierárquico"**.
+
+```text
+                 AGENTE
+                    │
+             ┌──────┴──────┐
+             │             │
+          Reflexo       Deliberação
+             │             │
+          código          LLM
+             │             │
+       rápido <1ms     mais lento
+             │             │
+             └──────┬──────┘
+                    │
+                 AÇÃO
+```
+
+Exemplo:
+
+```text
+Alguém pergunta:
+
+"Você roubou o dinheiro?"
+
+Sistema:
+
+1. código verifica:
+   → personagem sabe a verdade?
+
+2. código:
+   → confiança
+   → medo
+   → culpa
+   → personalidade
+
+3. decisão:
+   → MENTIR
+
+4. LLM:
+   → transforma MENTIR em uma resposta natural.
+```
+
+Você já está fazendo **parte disso**. 
+
+A evolução seria generalizar esse mecanismo para **todas as ações**, e não apenas `REVELAR/ESCONDER/MENTIR`.
+
+---
+
+# 27. Eu também mudaria a estrutura do projeto
+
+Hoje está relativamente concentrado em quatro arquivos grandes. ([GitHub][1])
+
+Eu migraria para:
+
+```text
+Contracenador/
+│
+├── contracenador/
+│   │
+│   ├── agents/
+│   │   ├── agent.py
+│   │   ├── personality.py
+│   │   ├── memory.py
+│   │   ├── beliefs.py
+│   │   ├── emotions.py
+│   │   ├── relationships.py
+│   │   └── actions.py
+│   │
+│   ├── world/
+│   │   ├── world.py
+│   │   ├── events.py
+│   │   ├── evidence.py
+│   │   └── locations.py
+│   │
+│   ├── simulation/
+│   │   ├── engine.py
+│   │   ├── scheduler.py
+│   │   └── turn.py
+│   │
+│   ├── memory/
+│   │   ├── sqlite.py
+│   │   ├── fts.py
+│   │   └── embeddings.py
+│   │
+│   ├── llm/
+│   │   ├── client.py
+│   │   ├── prompts.py
+│   │   └── model_manager.py
+│   │
+│   ├── scenarios/
+│   │   ├── generator.py
+│   │   ├── validator.py
+│   │   └── loader.py
+│   │
+│   └── cli/
+│       └── main.py
+│
+├── tests/
+├── scenarios/
+├── docs/
+├── pyproject.toml
+└── README.md
+```
+
+Não precisa fazer isso agora. Mas se você pretende transformar isso em um projeto grande, **eu faria antes de adicionar centenas de funcionalidades**.
+
+---
+
+# 28. Testes automatizados seriam extremamente importantes
+
+Você já tem `--semente`, o que é excelente para testes reproduzíveis. 
+
+Eu criaria testes do tipo:
+
+```text
+test_memory_isolation()
+test_private_memory_not_shared()
+test_lie_does_not_leak_truth()
+test_contradiction_detection()
+test_relationship_decay()
+test_fear_decay()
+test_agent_remembers_revelation()
+test_agent_does_not_repeat_revelation()
+test_investigator_can_solve_case()
+test_culprit_can_escape()
+```
+
+E principalmente:
+
+```text
+1000 simulações
+↓
+estatísticas
+```
+
+Por exemplo:
+
+```text
+1000 cenas
+
+Investigador descobriu:
+61.4%
+
+Culpado escapou:
+38.6%
+
+Média de rodadas:
+9.7
+
+Média de mentiras:
+4.2
+
+Média de contradições:
+2.1
+```
+
+Isso permitiria você **calibrar matematicamente** os pesos do sistema em vez de escolher valores manualmente.
+
+---
+
+# 29. Um "modo desenvolvedor" seria fantástico
+
+Algo como:
+
+```text
+/debug on
+```
+
+E mostrar:
+
+```text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+JOÃO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EMOÇÕES
+medo       ███████░░░ 0.71
+culpa      ███░░░░░░░ 0.32
+raiva      █████░░░░░ 0.51
+
+RELAÇÃO COM MARIA
+confiança  0.21
+medo       0.64
+dúvida     0.81
+
+OBJETIVO
+não ser descoberto
+
+AÇÃO
+MENTIR
+
+PROBABILIDADES
+mentir     72%
+esconder   21%
+confessar   7%
+
+MEMÓRIAS CONSULTADAS
+#14  João estava na cozinha
+#22  Maria viu João
+#31  cofre estava aberto
+
+HIPÓTESE
+Maria suspeita de João: 84%
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Isso tornaria seu projeto **muito mais fácil de depurar e desenvolver**.
+
+---
+
+# 30. Minha visão para o Contracenador
+
+Eu faria o projeto evoluir para isto:
+
+```text
+                    CONTRACENADOR
+                         │
+                  ┌──────┴──────┐
+                  │             │
+                MUNDO         AGENTES
+                  │             │
+       ┌──────────┼───────┐     │
+       │          │       │     │
+     tempo     eventos  objetos │
+                                │
+             ┌──────────────────┼────────────────┐
+             │                  │                │
+          memória            crenças         emoções
+             │                  │                │
+          relações          objetivos         planos
+             │                  │                │
+             └──────────────────┼────────────────┘
+                                │
+                           DECISÃO
+                                │
+                         ┌──────┴──────┐
+                         │             │
+                       código         LLM
+                         │             │
+                    ação válida    verbalização
+                         │             │
+                         └──────┬──────┘
+                                │
+                              MUNDO
+```
+
+E aí você pode colocar praticamente qualquer cenário em cima disso:
+
+```text
+🕵️ investigação
+🏰 RPG
+🚀 ficção científica
+🏢 escritório
+🏫 escola
+🏙️ cidade
+🧟 sobrevivência
+🎭 drama
+💰 crime
+🤖 sociedade de agentes
+```
+
+O **mesmo motor** continua funcionando.
+
+---
+
+## O que eu priorizaria
+
+Se fosse meu projeto, eu faria nesta ordem:
+
+| Prioridade | Sistema                       | Impacto    |
+| ---------- | ----------------------------- | ---------- |
+| 🔴 1       | **WorldState**                | Enorme     |
+| 🔴 2       | **Crenças ≠ verdade**         | Enorme     |
+| 🔴 3       | **Evidências + contradições** | Enorme     |
+| 🔴 4       | **Objetivos + ações**         | Enorme     |
+| 🔴 5       | **Memória semântica**         | Alto       |
+| 🟠 6       | Percepção imperfeita          | Alto       |
+| 🟠 7       | Hipóteses do investigador     | Alto       |
+| 🟠 8       | Sistema de fofoca             | Alto       |
+| 🟠 9       | Scheduler de agentes          | Alto       |
+| 🟡 10      | Personalidade avançada        | Médio/alto |
+| 🟡 11      | Interface gráfica             | Médio      |
+| 🟡 12      | Voz/avatar                    | Depois     |
+
+**Eu não começaria pela interface gráfica nem por modelos maiores.** A parte mais valiosa do seu projeto é justamente o **motor de simulação** que já está aparecendo por baixo do código.
+
+E tem uma oportunidade particularmente boa aqui: **transformar o Contracenador em uma engine genérica de agentes, deixando "investigação criminal" como apenas um tipo de cenário/plugin**. O seu `roteirista.py` já está caminhando nessa direção ao separar geração do cenário da materialização dos agentes. 
+
+Se você quiser continuar esse projeto seriamente, o próximo passo que eu faria é **desenhar a arquitetura 2.0 completa antes de alterar o código**: banco de dados do mundo + banco dos agentes + sistema de eventos + crenças + evidências + objetivos + ações + scheduler + LLM. Isso evitaria você precisar reescrever `Ator.py` inteiro depois.
+
+[1]: https://github.com/PaolinhodaMandioca/Contracenador "GitHub - PaolinhodaMandioca/Contracenador: Codigo capag de gerir dois atores(agentes de ia) para conversarem entre si para gerar algumresultado · GitHub"
