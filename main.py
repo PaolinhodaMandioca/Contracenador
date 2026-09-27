@@ -28,7 +28,7 @@ import time
 
 from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar, normalizar
 from llm import LLM
-from mundo import abrir_mundo, buscar_evento_tipo, registrar_evento
+from mundo import abrir_mundo, buscar_evento_tipo, evidencias_por_origem, registrar_evento
 from roteirista import gerar_cena_llm, materializar_cena
 
 
@@ -516,15 +516,18 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         if escolha.isdigit() and 1 <= int(escolha) <= len(suspeitos):
             alvo = suspeitos[int(escolha) - 1]
         elif escolha in ("", "a", "auto", "automatico", "automático"):
-            # Heurística: prioriza quem ainda não foi interrogado e quem tem maior desconfiança
-            alvo = max(
-                suspeitos,
-                key=lambda s: (
-                    investigador.relacao(s.nome)["desconfianca"]
+            # Heurística: prioriza quem ainda não foi interrogado, quem tem maior desconfiança
+            # e o principal suspeito segundo as crenças já formadas (ver atualizar_crenca acima).
+            def pontuacao(s):
+                crenca = investigador.crenca(f"{s.nome} é o culpado")
+                suspeita = crenca["confianca"] if crenca else 0.0
+                return (
+                    0.6 * suspeita
+                    + 0.4 * investigador.relacao(s.nome)["desconfianca"]
                     + (0.4 if s.nome not in investigador.satisfeitos else 0.0)
                     + random.uniform(0.0, 0.2)
                 )
-            )
+            alvo = max(suspeitos, key=pontuacao)
             print(f"-> {investigador.nome} decide focar em {alvo.nome}.")
         else:
             achados = [s for s in suspeitos if normalizar(s.nome) == normalizar(escolha)]
@@ -554,6 +557,26 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         if envelope_resposta.get("fatos"):
             registrar_evento(mundo, "revelacao", ator=alvo.nome, alvo=investigador.nome,
                               local="cena", dados={"proposicao": "; ".join(envelope_resposta["fatos"])})
+
+            # 3c) Crenças: o que o Roteirista ligou como evidência de {alvo} (mundo.db) vira
+            # reforço na hipótese "<assunto> é o culpado" do investigador. Investigador não
+            # sabe automaticamente quem é culpado - ele só reforça a hipótese na medida em
+            # que suspeitos concretos vão sendo apontados por quem ele interroga.
+            for ev in evidencias_por_origem(mundo, alvo.nome):
+                if ev["assunto"] and ev["assunto"] != investigador.nome:
+                    investigador.atualizar_crenca(
+                        f"{ev['assunto']} é o culpado", delta=0.2, origem=alvo.nome,
+                        assunto=ev["assunto"], evidencia=f"evidencia:{ev['id']}")
+
+            crenca_culpado = investigador.crenca(f"{culpado.nome} é o culpado")
+            if crenca_culpado and crenca_culpado["confianca"] >= 0.75 and not vitoria:
+                print(f"\n{'*' * 65}")
+                print(f"*** VITÓRIA DA INVESTIGAÇÃO POR DEDUÇÃO! (Rodada {rodada}) ***")
+                print(f"{investigador.nome} tem {crenca_culpado['confianca']:.0%} de certeza de que "
+                      f"{culpado.nome} é o culpado, com base nas evidências reunidas.")
+                print(f"{'*' * 65}")
+                vitoria = True
+                break
 
         # 4) Plateia: os outros presentes na sala escutam tudo
         ouvintes = [a for a in suspeitos if a is not alvo]

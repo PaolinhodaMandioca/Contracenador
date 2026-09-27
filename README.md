@@ -13,11 +13,12 @@ Veja a visão completa e o roadmap do projeto em
 | Arquivo | Papel |
 |---|---|
 | `llm.py` | Cliente do llama-server (só biblioteca padrão, com streaming no terminal) |
-| `Ator.py` | Cérebro do Ator: banco, memória, emoções, decisões, prompts |
+| `Ator.py` | Cérebro do Ator: banco, memória, crenças, emoções, decisões, prompts |
+| `mundo.py` | O WorldState: locais, personagens, eventos e evidências (a verdade objetiva da cena) |
 | `roteirista.py` | O Roteirista: gera a cena e os 5 personagens via LLM (JSON estruturado) e materializa os `.db` |
 | `main.py` | Terminal + orquestrador; sobe/derruba os servidores llama-server automaticamente |
 | `atores/` | Criada na 1ª execução, um `.db` por ator (gerado pelo Roteirista ou por `/novo`) |
-| `cenario/` | Guarda `cena.json` com os metadados da cena atual (incidente, papéis, verdade) |
+| `cenario/` | Guarda `cena.json` (roteiro) e `mundo.db` (WorldState) da cena atual |
 
 Não há nada para instalar além de Python 3.8+ e o `llama-server` (llama.cpp). `main.py` sobe os
 servidores sozinho — não é preciso rodar `llama-server` manualmente.
@@ -75,6 +76,8 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
 | `/falsa <id> <texto>` | Escreve à mão a versão falsa de uma memória |
 | `/sobre <id> <nome>` | Diz de quem é o assunto de uma memória (sem nome remove) |
 | `/estado` | Traços, emoções e relações do Ator atual |
+| `/painel [outro]` | Painel de debug do Ator atual (emoções, traços, probabilidades, crenças/hipóteses) |
+| `/debug` | Liga/desliga o painel automático após cada resposta |
 | `/tracos <traço> <0 a 1>` | Muda um traço do Ator atual na hora |
 | `/novo <nome>` | Cria um Ator novo avulso (um `.db` novo) |
 | `/conversar <A> <B> <tópico>` | Faz A e B conversarem entre si sobre o tópico |
@@ -118,16 +121,30 @@ Os pesos estão em `decidir()` e `escolher_tatica()` (em `Ator.py`), e as meias-
   0.5 ou mais (ameaça, culpa, confiança). Sem isso, qualquer um acabaria contando por sorteio.
 - **Quem já conseguiu a informação** para de pressionar.
 
+## WorldState e crenças
+
+Desde a Fase 1 do roadmap, a verdade de cada cena vive em `cenario/mundo.db` (módulo `mundo.py`):
+locais, personagens, **eventos** (o que de fato aconteceu) e **evidências** (o que cada testemunha
+forneceu, e sobre quem). É separado da memória de cada Ator — verdade ≠ conhecimento ≠ crença
+(roadmap, seção 10).
+
+Cada Ator também tem uma tabela de **crenças** (`Ator.py`): uma proposição com um nível de
+confiança que evidências vão ajustando (`atualizar_crenca`). É o mesmo mecanismo tanto para crença
+social quanto para hipótese de investigação — o investigador de `/cena` forma e reforça a hipótese
+`"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
+**dedução** (confiança ≥ 75%) mesmo sem uma confissão. Veja com `/painel` (seção "HIPÓTESES").
+
 ## Limitações conhecidas
 
 - Busca de memória por palavras em comum (sem embeddings): a pergunta precisa usar palavras
   parecidas com as do fato.
-- Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções e
-  relações ficam no `.db`.
+- Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções,
+  relações e crenças ficam no `.db`.
 - Contradições não são detectadas (se um Ator mente e depois confessa, o outro fica com as duas
   versões).
-- Não existe um estado do mundo (`WorldState`) central: a "verdade" de cada cena vive apenas dentro
-  do `cena.json` gerado pelo Roteirista.
+- Só existe 1 local por cenário ainda: a percepção automática por local (em `mundo.py`) só é usada
+  para eventos durante a cena, não para decidir quem viu o crime inicial (isso continua vindo do
+  campo `viu` gerado pelo Roteirista).
 - Salvar fatos é sempre explícito (`/lembrar` ou gerado pelo Roteirista); o Ator não extrai fatos
   sozinho da conversa.
 

@@ -334,7 +334,7 @@ def materializar_cena(dados_cena, pasta_atores="atores", pasta_cenario="cenario"
                                       compartilhavel=1, sobre=culpado_nome)
                 print(f"   [Testemunha] {nome}: gravado fato observado sobre {culpado_nome} (memória #{id_mem}).")
                 if id_evento_crime is not None:
-                    registrar_evidencia(mundo, id_evento_crime, viu, origem=nome)
+                    registrar_evidencia(mundo, id_evento_crime, viu, origem=nome, assunto=culpado_nome)
             else:
                 print(f"   [Testemunha] {nome}: não presenciou nada relevante (sem memórias iniciais).")
 

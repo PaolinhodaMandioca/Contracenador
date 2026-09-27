@@ -85,6 +85,22 @@ CREATE TABLE IF NOT EXISTS relacoes (
     favor_devido  REAL DEFAULT 0,   -- o quanto EU devo a esse agente (ele me contou coisas)
     atualizado_em REAL
 );
+
+-- Crença = uma proposição em que este Ator confia mais ou menos (0 a 1), e que evidências vão
+-- ajustando aos poucos. Serve tanto para crença social ("Maria confia em mim") quanto para
+-- hipótese de investigação ("João é o culpado") - roadmap, seções 12 e 22, tratadas aqui como o
+-- MESMO mecanismo, só com `assunto` diferente. Diferente de `memorias`: memória é "eu soube que
+-- X", crença é "o quanto eu acho que X é verdade" (pode subir e descer com o tempo).
+CREATE TABLE IF NOT EXISTS crencas (
+    id            INTEGER PRIMARY KEY,
+    proposicao    TEXT NOT NULL UNIQUE,   -- ex.: "Joao é o culpado"
+    assunto       TEXT,                   -- de quem/o que é a crença (ex.: "Joao") - permite listar por assunto
+    confianca     REAL DEFAULT 0.5,
+    origem        TEXT,                   -- quem/o que motivou a última mudança
+    evidencias    TEXT DEFAULT '[]',      -- JSON: lista de referências soltas (ex.: ids de mundo.db)
+    criada_em     REAL,
+    atualizada_em REAL
+);
 """
 
 
@@ -298,6 +314,75 @@ class Agente:
                                  (nome.strip() if nome else None, id_memoria))
         self.db.commit()
         return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # 4.1b) CRENÇAS: o quanto confio em cada proposição (verdade != crença, seção 10)
+    # ------------------------------------------------------------------
+
+    def crenca(self, proposicao):
+        """Devolve a crença (dict) para uma proposição exata, ou None se não existir ainda."""
+        linha = self.db.execute("SELECT * FROM crencas WHERE proposicao=?",
+                                (proposicao.strip(),)).fetchone()
+        if linha is None:
+            return None
+        d = dict(linha)
+        d["evidencias"] = json.loads(d["evidencias"] or "[]")
+        return d
+
+    def formar_crenca(self, proposicao, confianca=0.5, origem=None, assunto=None, evidencia=None):
+        """Cria a crença se a proposição ainda não existir (não duplica). Devolve a crença atual."""
+        proposicao = proposicao.strip()
+        existente = self.crenca(proposicao)
+        if existente:
+            return existente
+        agora = time.time()
+        self.db.execute(
+            "INSERT INTO crencas(proposicao, assunto, confianca, origem, evidencias, criada_em, atualizada_em) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (proposicao, assunto, limitar(confianca), origem,
+             json.dumps([evidencia] if evidencia else []), agora, agora))
+        self.db.commit()
+        return self.crenca(proposicao)
+
+    def atualizar_crenca(self, proposicao, delta, origem=None, assunto=None, evidencia=None):
+        """
+        Ajusta a confiança de uma crença por `delta` (positivo reforça, negativo enfraquece),
+        criando-a com confiança-base 0.5 se ainda não existir. Cada evidência que motivou a
+        mudança fica registrada (útil para reconstruir por que o Ator acredita nisso).
+        """
+        c = self.formar_crenca(proposicao, confianca=0.5, origem=origem, assunto=assunto)
+        nova_confianca = limitar(c["confianca"] + delta)
+        evidencias = c["evidencias"]
+        if evidencia and evidencia not in evidencias:
+            evidencias.append(evidencia)
+        self.db.execute(
+            "UPDATE crencas SET confianca=?, origem=?, assunto=?, evidencias=?, atualizada_em=? "
+            "WHERE proposicao=?",
+            (nova_confianca, origem or c["origem"], assunto or c["assunto"],
+             json.dumps(evidencias), time.time(), proposicao.strip()))
+        self.db.commit()
+        return self.crenca(proposicao)
+
+    def crencas_sobre(self, assunto, k=5):
+        """Crenças cujo assunto é `assunto`, da mais para a menos confiante (ex.: hipóteses de
+        um investigador sobre um suspeito específico)."""
+        linhas = self.db.execute(
+            "SELECT * FROM crencas WHERE assunto=? ORDER BY confianca DESC LIMIT ?", (assunto, k))
+        resultado = []
+        for linha in linhas:
+            d = dict(linha)
+            d["evidencias"] = json.loads(d["evidencias"] or "[]")
+            resultado.append(d)
+        return resultado
+
+    def listar_crencas(self, k=10):
+        linhas = self.db.execute("SELECT * FROM crencas ORDER BY confianca DESC LIMIT ?", (k,))
+        resultado = []
+        for linha in linhas:
+            d = dict(linha)
+            d["evidencias"] = json.loads(d["evidencias"] or "[]")
+            resultado.append(d)
+        return resultado
 
     # ------------------------------------------------------------------
     # 4.2) ESTADO EMOCIONAL: culpa e frustração (com decaimento preguiçoso)
@@ -671,6 +756,13 @@ class Agente:
                     ids = ", ".join(f"#{i}" for i in dados["memorias_consultadas"])
                     linhas.append(f"MEMÓRIAS CONSULTADAS: {ids}")
                 linhas.append("")
+
+        crencas = self.listar_crencas()
+        if crencas:
+            linhas.append("HIPÓTESES / CRENÇAS")
+            for c in crencas:
+                linhas.append(f"  {barra(c['confianca'])}  {c['proposicao']}")
+            linhas.append("")
 
         linhas.append("━" * (2 * largura + len(self.nome) + 2))
         return "\n".join(linhas)

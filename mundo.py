@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS evidencias (
     tipo           TEXT DEFAULT 'testemunho',  -- 'testemunho' | 'fisica' | 'documental' ...
     conteudo       TEXT NOT NULL,
     origem         TEXT,                        -- quem forneceu a evidência
+    assunto        TEXT,                        -- de quem/o que ela é evidência (ex.: suspeito)
     confiabilidade REAL DEFAULT 0.7,
     hora           REAL
 );
@@ -208,11 +209,12 @@ def percepcao_textual(mundo, id_evento, testemunha=None):
 # EVIDÊNCIAS: entidades próprias, sempre ligadas a um evento
 # ============================================================================
 
-def registrar_evidencia(mundo, id_evento, conteudo, origem, tipo="testemunho", confiabilidade=0.7):
+def registrar_evidencia(mundo, id_evento, conteudo, origem, assunto=None, tipo="testemunho",
+                         confiabilidade=0.7):
     cursor = mundo.execute(
-        "INSERT INTO evidencias(evento_id, tipo, conteudo, origem, confiabilidade, hora) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (id_evento, tipo, conteudo, origem, confiabilidade, time.time()))
+        "INSERT INTO evidencias(evento_id, tipo, conteudo, origem, assunto, confiabilidade, hora) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (id_evento, tipo, conteudo, origem, assunto, confiabilidade, time.time()))
     mundo.commit()
     return cursor.lastrowid
 
@@ -220,3 +222,11 @@ def registrar_evidencia(mundo, id_evento, conteudo, origem, tipo="testemunho", c
 def evidencias_do_evento(mundo, id_evento):
     return [dict(e) for e in mundo.execute(
         "SELECT * FROM evidencias WHERE evento_id=? ORDER BY id", (id_evento,))]
+
+
+def evidencias_por_origem(mundo, origem):
+    """Evidências fornecidas por alguém (ex.: o que uma testemunha específica contou), da mais
+    recente para a mais antiga. Usado para o investigador ligar 'quem acabou de me contar algo'
+    a 'sobre quem era isso', ao formar/atualizar uma crença."""
+    return [dict(e) for e in mundo.execute(
+        "SELECT * FROM evidencias WHERE origem=? ORDER BY id DESC", (origem,))]
