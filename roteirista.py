@@ -21,6 +21,7 @@ import sys
 from Ator import Ator, TRACOS_PADRAO, criar_ator, limitar
 from llm import LLM
 from mundo import abrir_mundo, posicionar, registrar_evento, registrar_evidencia, registrar_local
+from nomes import sortear_nomes
 
 SCHEMA_CENA = {
     "type": "object",
@@ -187,10 +188,20 @@ def gerar_cena_llm(llm, tema, max_tokens=1800, temperatura=0.7):
     """
     Solicita ao modelo a criação da cena e dos 5 atores a partir do tema proposto.
     Tenta usar response_format para forçar JSON e trata possíveis incompatibilidades.
+
+    Os NOMES dos personagens são sorteados pelo código (nomes.py), não inventados pelo LLM -
+    escolher um nome não exige criatividade nem entendimento de contexto, é exatamente o tipo
+    de decisão que cabe ao código (mesma filosofia do resto do projeto). O LLM só usa os nomes
+    já sorteados ao escrever a trama (personalidade, papel, quem viu o quê).
     """
+    nomes_sorteados = sortear_nomes(5)
     mensagens = [
         {"role": "system", "content": PROMPT_SISTEMA_ROTEIRISTA},
-        {"role": "user", "content": f"Crie um mistério completo com 5 personagens sobre o seguinte tema:\n\"{tema}\""}
+        {"role": "user", "content": (
+            f"Crie um mistério completo com 5 personagens sobre o seguinte tema:\n\"{tema}\"\n\n"
+            "Use OBRIGATORIAMENTE estes 5 nomes, um para cada personagem (você decide quem tem "
+            f"qual papel): {', '.join(nomes_sorteados)}."
+        )}
     ]
 
     print(f"\n[Roteirista] Conectando a {llm.url} para criar a cena...")
@@ -233,6 +244,13 @@ def gerar_cena_llm(llm, tema, max_tokens=1800, temperatura=0.7):
 
     dados = extrair_json(resposta_texto)
     validar_dados_cena(dados)
+
+    usados = {a.get("nome") for a in dados.get("atores", [])}
+    if not set(nomes_sorteados) <= usados:
+        ignorados = set(nomes_sorteados) - usados
+        print(f"   [aviso] O modelo não usou todos os nomes sorteados (ignorou: "
+              f"{', '.join(sorted(ignorados))}). Seguindo com os nomes que ele escreveu.")
+
     return dados
 
 

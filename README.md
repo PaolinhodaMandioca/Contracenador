@@ -15,6 +15,7 @@ Veja a visão completa e o roadmap do projeto em
 | `llm.py` | Cliente do llama-server (só biblioteca padrão, com streaming no terminal) |
 | `Ator.py` | Cérebro do Ator: banco, memória, crenças, emoções, decisões, prompts |
 | `mundo.py` | O WorldState: locais, personagens, eventos e evidências (a verdade objetiva da cena) |
+| `nomes.py` | Banco de nomes prontos; o código sorteia, o Roteirista só usa (não inventa nomes) |
 | `roteirista.py` | O Roteirista: gera a cena e os 5 personagens via LLM (JSON estruturado) e materializa os `.db` |
 | `main.py` | Terminal + orquestrador; sobe/derruba os servidores llama-server automaticamente |
 | `atores/` | Criada na 1ª execução, um `.db` por ator (gerado pelo Roteirista ou por `/novo`) |
@@ -135,6 +136,16 @@ social quanto para hipótese de investigação — o investigador de `/cena` for
 `"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
 **dedução** (confiança ≥ 75%) mesmo sem uma confissão. Veja com `/painel` (seção "HIPÓTESES").
 
+## Nomes dos personagens vêm de um banco, não da criatividade do LLM
+
+Escolher um nome não exige entendimento de contexto - é o tipo de decisão que cabe ao código.
+`nomes.py` sorteia 5 nomes únicos ("Primeiro Sobrenome", sem repetir nem o primeiro nome nem o
+sobrenome entre si) e o Roteirista recebe a ordem de **usar exatamente esses nomes** ao escrever
+a trama - ele só decide personalidade, papel e quem viu o quê, os nomes já vêm prontos. Isso evita
+nomes malformados, incompletos ou repetidos, e ainda economiza tokens do LLM com algo que não
+precisa de criatividade nenhuma. Se o modelo ignorar algum nome sorteado, `/roteiro` avisa mas
+segue em frente com o que ele escreveu (nunca trava a geração por isso).
+
 ## Quem interrogar é sempre decisão do investigador
 
 Em `/cena`, ninguém escolhe por ele - nem o usuário (não há menu), nem um sorteio puro. A cada
@@ -188,7 +199,7 @@ python -m unittest discover -s tests -v
 ```
 
 Testes determinísticos (`tests/test_ator.py`, `tests/test_mundo.py`, `tests/test_roteirista.py`,
-`tests/test_main.py`): memória e isolamento, mentira não vaza a verdade, fofoca relatada em
+`tests/test_main.py`, `tests/test_nomes.py`): memória e isolamento, mentira não vaza a verdade, fofoca relatada em
 terceira pessoa (não primeira), DESVIAR exige objetivo + candidato, contradição, crenças,
 objetivos, decaimento de emoção, escolha autônoma de quem interrogar, WorldState, materialização
 de cena e reconhecimento de nomes com espaço em `/conversar`.

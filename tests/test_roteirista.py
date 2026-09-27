@@ -1,6 +1,9 @@
-"""Testes determinísticos do Roteirista (roteirista.py): validação de JSON e materialização
-da cena (WorldState + Atores), sem nenhuma chamada a LLM."""
+"""Testes determinísticos do Roteirista (roteirista.py): validação de JSON, materialização
+da cena (WorldState + Atores) e o uso dos nomes sorteados pelo código. Nenhum LLM de verdade -
+os testes de gerar_cena_llm usam um FakeLLM que devolve um JSON fixo."""
+import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -10,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Ator import Ator
 from mundo import abrir_mundo, buscar_evento_tipo, evidencias_do_evento
-from roteirista import extrair_json, materializar_cena, validar_dados_cena
+from roteirista import extrair_json, gerar_cena_llm, materializar_cena, validar_dados_cena
 
 
 class TestExtrairJson(unittest.TestCase):
@@ -26,6 +29,62 @@ class TestExtrairJson(unittest.TestCase):
     def test_levanta_erro_sem_json(self):
         with self.assertRaises(ValueError):
             extrair_json("nada de json aqui")
+
+
+class LLMObedienteFake:
+    """Simula um roteirista que usa exatamente os nomes exigidos no prompt (o caso normal:
+    ver aviso em gerar_cena_llm se algum nome sorteado não for usado)."""
+
+    url = "fake"
+
+    def gerar(self, mensagens, **kwargs):
+        conteudo = mensagens[-1]["content"]
+        nomes = [n.strip() for n in
+                re.search(r"Use OBRIGATORIAMENTE estes 5 nomes.*?: (.+?)\.", conteudo).group(1).split(",")]
+        atores = [
+            {"nome": nomes[0], "papel": "culpado", "verdade": "v", "alibi": "a",
+             "descricao": "d", "exemplos": [], "tracos": {}},
+            {"nome": nomes[1], "papel": "investigador", "objetivo": "o",
+             "descricao": "d", "exemplos": [], "tracos": {}},
+        ] + [
+            {"nome": n, "papel": "testemunha", "viu": None,
+             "descricao": "d", "exemplos": [], "tracos": {}}
+            for n in nomes[2:]
+        ]
+        return json.dumps({"cena": "teste", "atores": atores})
+
+
+class LLMDesobedienteFake:
+    """Simula um roteirista que ignora os nomes exigidos e inventa os seus - gerar_cena_llm
+    deve seguir em frente mesmo assim (só avisa), nunca travar por isso."""
+
+    url = "fake"
+
+    def gerar(self, mensagens, **kwargs):
+        atores = [
+            {"nome": "Fulano Um", "papel": "culpado", "verdade": "v", "alibi": "a",
+             "descricao": "d", "exemplos": [], "tracos": {}},
+            {"nome": "Fulano Dois", "papel": "investigador", "objetivo": "o",
+             "descricao": "d", "exemplos": [], "tracos": {}},
+        ]
+        return json.dumps({"cena": "teste", "atores": atores})
+
+
+class TestGerarCenaLlm(unittest.TestCase):
+    """Os nomes vêm do banco sorteado pelo código (nomes.py), não da criatividade do LLM - ver
+    gerar_cena_llm. O prompt exige que o modelo use exatamente os nomes sorteados."""
+
+    def test_usa_os_5_nomes_sorteados_pelo_codigo(self):
+        dados = gerar_cena_llm(LLMObedienteFake(), "tema qualquer")
+        nomes_usados = [a["nome"] for a in dados["atores"]]
+        self.assertEqual(len(nomes_usados), 5)
+        self.assertEqual(len(set(nomes_usados)), 5)  # sem repetição
+        for nome in nomes_usados:
+            self.assertEqual(len(nome.split()), 2)  # "Primeiro Sobrenome"
+
+    def test_llm_que_ignora_os_nomes_nao_quebra_a_geracao(self):
+        dados = gerar_cena_llm(LLMDesobedienteFake(), "tema qualquer")
+        self.assertEqual(dados["atores"][0]["nome"], "Fulano Um")
 
 
 class TestValidarDadosCena(unittest.TestCase):
