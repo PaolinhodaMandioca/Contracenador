@@ -494,6 +494,15 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         investigador.nova_conversa(s.nome)
         s.nova_conversa(investigador.nome)
 
+    # Registro de presença: todo mundo na sala "conhece" (relação neutra) todo mundo, mesmo
+    # antes de conversarem - é o que permite ao culpado escolher um bode expiatório em DESVIAR
+    # (Ator.escolher_acao só considera quem já tem relação registrada).
+    presentes = list(atores.values())
+    for a in presentes:
+        for b in presentes:
+            if a is not b:
+                a.relacao(b.nome)
+
     vitoria = False
 
     for rodada in range(1, turnos_max + 1):
@@ -605,6 +614,10 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
         print(f"A verdade que ficou oculta foi:")
         print(f"\"{verdade_exata}\"")
         print(f"{'*' * 65}")
+
+    # Fecha os objetivos (roadmap, seção 17): dá desfecho explícito, não deixa "ativo" pra sempre.
+    investigador.atualizar_objetivo(topico, status="concluido" if vitoria else "falhou")
+    culpado.atualizar_objetivo("Não ser descoberto", status="falhou" if vitoria else "concluido")
 
     mundo.close()
     print("\n=== Resumo final dos personagens ===")

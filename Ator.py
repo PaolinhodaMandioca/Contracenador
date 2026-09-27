@@ -91,6 +91,20 @@ CREATE TABLE IF NOT EXISTS relacoes (
 -- hipótese de investigação ("João é o culpado") - roadmap, seções 12 e 22, tratadas aqui como o
 -- MESMO mecanismo, só com `assunto` diferente. Diferente de `memorias`: memória é "eu soube que
 -- X", crença é "o quanto eu acho que X é verdade" (pode subir e descer com o tempo).
+-- Objetivo estruturado (roadmap, seção 17): não é só uma memória de texto solta, tem prioridade,
+-- progresso e risco - o código usa isso para decidir quais AÇÕES ficam disponíveis (ver
+-- escolher_acao), não só o que dizer.
+CREATE TABLE IF NOT EXISTS objetivos (
+    id            INTEGER PRIMARY KEY,
+    descricao     TEXT NOT NULL UNIQUE,
+    prioridade    REAL DEFAULT 0.5,
+    progresso     REAL DEFAULT 0.0,
+    risco         REAL DEFAULT 0.0,
+    status        TEXT DEFAULT 'ativo',    -- 'ativo' | 'concluido' | 'falhou'
+    criado_em     REAL,
+    atualizado_em REAL
+);
+
 CREATE TABLE IF NOT EXISTS crencas (
     id            INTEGER PRIMARY KEY,
     proposicao    TEXT NOT NULL UNIQUE,   -- ex.: "Joao é o culpado"
@@ -385,6 +399,51 @@ class Agente:
         return resultado
 
     # ------------------------------------------------------------------
+    # 4.1c) OBJETIVOS: metas com prioridade/progresso/risco (roadmap, seção 17)
+    # ------------------------------------------------------------------
+
+    def objetivo(self, descricao):
+        linha = self.db.execute("SELECT * FROM objetivos WHERE descricao=?",
+                                (descricao.strip(),)).fetchone()
+        return dict(linha) if linha else None
+
+    def formar_objetivo(self, descricao, prioridade=0.5, risco=0.0):
+        """Cria o objetivo se ainda não existir (não duplica). Devolve o objetivo atual."""
+        descricao = descricao.strip()
+        existente = self.objetivo(descricao)
+        if existente:
+            return existente
+        agora = time.time()
+        self.db.execute(
+            "INSERT INTO objetivos(descricao, prioridade, progresso, risco, status, criado_em, atualizado_em) "
+            "VALUES (?, ?, 0.0, ?, 'ativo', ?, ?)",
+            (descricao, limitar(prioridade), limitar(risco), agora, agora))
+        self.db.commit()
+        return self.objetivo(descricao)
+
+    def atualizar_objetivo(self, descricao, progresso=None, status=None):
+        o = self.objetivo(descricao)
+        if o is None:
+            return None
+        progresso = limitar(progresso) if progresso is not None else o["progresso"]
+        status = status or o["status"]
+        self.db.execute("UPDATE objetivos SET progresso=?, status=?, atualizado_em=? WHERE descricao=?",
+                        (progresso, status, time.time(), descricao))
+        self.db.commit()
+        return self.objetivo(descricao)
+
+    def objetivos_ativos(self, k=5):
+        linhas = self.db.execute(
+            "SELECT * FROM objetivos WHERE status='ativo' ORDER BY prioridade DESC LIMIT ?", (k,))
+        return [dict(l) for l in linhas]
+
+    def objetivo_principal(self):
+        """O objetivo ativo de maior prioridade, ou None se não houver nenhum - usado pelo
+        código para liberar (ou não) ações mais arriscadas, como DESVIAR em escolher_acao()."""
+        ativos = self.objetivos_ativos(k=1)
+        return ativos[0] if ativos else None
+
+    # ------------------------------------------------------------------
     # 4.2) ESTADO EMOCIONAL: culpa e frustração (com decaimento preguiçoso)
     # ------------------------------------------------------------------
 
@@ -431,12 +490,29 @@ class Agente:
     # 4.4) DECISÕES (o coração do comportamento) - tudo em código, sem LLM
     # ------------------------------------------------------------------
 
-    def decidir(self, fato, outro):
+    def _escolher_bode_expiatorio(self, outro):
         """
-        O que fazer com UM fato quando `outro` pergunta sobre ele?
-        Retorna (decisao, chance_de_revelar), com decisao = REVELAR | ESCONDER | MENTIR.
-        Cada linha abaixo é um "empurrão" a favor (+) ou contra (-) de contar a verdade.
-        Os pesos são só um ponto de partida: ajuste testando.
+        Escolhe um terceiro conhecido (que não seja `outro` nem eu) para culpar em DESVIAR.
+        Só considera quem já tem uma relação registrada - ou seja, quem já está "na sala",
+        já que `relacao()` cria essa linha para todo participante presente no início da cena
+        (ver cmd_cena em main.py). Sem candidato, DESVIAR simplesmente não é oferecido.
+        """
+        candidatos = [linha["outro"] for linha in
+                      self.db.execute("SELECT outro FROM relacoes WHERE outro != ?", (outro,))]
+        return random.choice(candidatos) if candidatos else None
+
+    def escolher_acao(self, fato, outro):
+        """
+        O que fazer com UM fato quando `outro` pergunta sobre ele? Generaliza o antigo
+        REVELAR/ESCONDER/MENTIR (roadmap, seções 18-19): quem tem um objetivo ativo de alta
+        prioridade (ex.: "Não ser descoberto") e o perfil certo para isso pode arriscar DESVIAR
+        a suspeita para um terceiro, em vez de só se esquivar. Não é uma opção sempre
+        disponível - é uma AÇÃO POSSÍVEL que o código libera conforme a situação, não o LLM
+        que inventa.
+
+        Retorna (decisao, extra, chance_de_revelar):
+          decisao = REVELAR | ESCONDER | MENTIR | DESVIAR
+          extra   = None, exceto para DESVIAR, onde é {"alvo_falso": nome}
         """
         t = self.pers["tracos"]
         rel = self.relacao(outro)
@@ -453,25 +529,41 @@ class Agente:
         )
         p_revelar = sigmoid(quer_revelar)
 
-        # POSTURA PERSISTENTE: se eu já decidi esconder/mentir sobre este fato nesta conversa,
-        # mantenho a decisão enquanto nada mudar de verdade. Sem isso, sortear de novo a cada
-        # fala faria qualquer um acabar contando (é só esperar o sorteio). Ameaça, culpa ou
-        # confiança que mexem no placar em 0.5 ou mais fazem o agente reconsiderar.
+        # POSTURA PERSISTENTE: se eu já decidi esconder/mentir/desviar sobre este fato nesta
+        # conversa, mantenho a decisão enquanto nada mudar de verdade. Sem isso, sortear de novo
+        # a cada fala faria qualquer um acabar contando (é só esperar o sorteio). Ameaça, culpa
+        # ou confiança que mexem no placar em 0.5 ou mais fazem o agente reconsiderar.
         chave = (outro, fato["id"])
         anterior = self.posturas.get(chave)
         if anterior and abs(quer_revelar - anterior[1]) < 0.5:
-            return anterior[0], p_revelar
+            decisao, _, extra = anterior
+            return decisao, extra, p_revelar
 
         if random.random() < p_revelar:
-            decisao = "REVELAR"
+            decisao, extra = "REVELAR", None
         else:
-            # Não vou contar a verdade: minto ou só escondo? Mentir exige dissimulação, pouca
-            # honestidade e pouca culpa, e só vale a pena para fatos sensíveis.
-            p_mentir = (t["dissimulacao"] * (1 - t["honestidade"])
-                        * (1 - 0.7 * culpa) * fato["sensibilidade"])
-            decisao = "MENTIR" if (fato["versao_falsa"] and random.random() < p_mentir) else "ESCONDER"
-        self.posturas[chave] = (decisao, quer_revelar)
-        return decisao, p_revelar
+            # Não vou contar a verdade: minto, escondo ou desvio a suspeita? DESVIAR só entra em
+            # jogo se um objetivo concreto justificar o risco (não é personalidade sozinha).
+            objetivo = self.objetivo_principal()
+            arrisca_desviar = (
+                objetivo is not None and objetivo["prioridade"] >= 0.7
+                and t["dissimulacao"] >= 0.6 and t["empatia"] < 0.5
+                and fato["sensibilidade"] >= 0.7
+            )
+            alvo_falso = self._escolher_bode_expiatorio(outro) if arrisca_desviar else None
+            if alvo_falso:
+                decisao, extra = "DESVIAR", {"alvo_falso": alvo_falso}
+            else:
+                # Mentir exige dissimulação, pouca honestidade e pouca culpa, e só vale a pena
+                # para fatos sensíveis.
+                p_mentir = (t["dissimulacao"] * (1 - t["honestidade"])
+                            * (1 - 0.7 * culpa) * fato["sensibilidade"])
+                if fato["versao_falsa"] and random.random() < p_mentir:
+                    decisao, extra = "MENTIR", None
+                else:
+                    decisao, extra = "ESCONDER", None
+        self.posturas[chave] = (decisao, quer_revelar, extra)
+        return decisao, extra, p_revelar
 
     def escolher_tatica(self, outro):
         """
@@ -615,6 +707,18 @@ class Agente:
             self.mudar_relacao(outro, confianca=0.05, favor_devido=0.1)
             self._log(f"{self.nome} aprendeu com {outro}: {fato!r}")
 
+        # (b2) Acusações (ação DESVIAR, ver escolher_acao): reforçam uma CRENÇA meu sobre o
+        #      acusado, não uma memória de fato consumado - é só a palavra de {outro} contra
+        #      alguém, com peso reduzido (ver 'peso' na acusação). Quem é o próprio acusado
+        #      ignora o boato: ele já sabe se é inocente ou não, não aprende isso ouvindo.
+        for ac in env.get("acusacoes", []):
+            if ac["assunto"] == self.nome:
+                continue
+            peso = ac.get("peso", 0.15)
+            self.atualizar_crenca(f"{ac['assunto']} é o culpado", delta=peso, origem=outro,
+                                  assunto=ac["assunto"], evidencia=f"acusacao:{outro}")
+            self._log(f"{self.nome} ouviu {outro} insinuar que {ac['assunto']} pode estar envolvido")
+
         # (c) Se eu tinha pedido algo (e sou o alvo da resposta): vieram fatos? Sem informação, a frustração sobe
         #     (e alimenta a chance de ameaçar); com informação, ela cai.
         if self.aguardando and sou_alvo:
@@ -648,10 +752,10 @@ class Agente:
         pendentes = [m for m in sobre_terceiros
                      if (outro, m["id"]) not in self.contados and m["origem"] != outro][:2]
 
-        # 3) Para cada fato sobre terceiros, o CÓDIGO decide REVELAR, ESCONDER ou MENTIR.
-        fatos_saida, escondeu, decisoes_debug = [], False, []
+        # 3) Para cada fato sobre terceiros, o CÓDIGO decide REVELAR, ESCONDER, MENTIR ou DESVIAR.
+        fatos_saida, acusacoes, escondeu, decisoes_debug = [], [], False, []
         for fato in pendentes:
-            decisao, p = self.decidir(fato, outro)
+            decisao, extra, p = self.escolher_acao(fato, outro)
             self._log(f"{self.nome} decidiu {decisao} (chance de revelar: {p:.0%}) "
                       f"sobre: {fato['texto']!r}")
             decisoes_debug.append((fato["texto"], decisao, p))
@@ -662,33 +766,43 @@ class Agente:
                 # O prompt recebe SÓ a versão falsa: a verdade não entra nele.
                 fatos_saida.append(fato["versao_falsa"])
                 self.mudar_estado("culpa", 0.1 + 0.4 * self.pers["tracos"]["empatia"])  # empatia = mais culpa
+            elif decisao == "DESVIAR":
+                alvo_falso = extra["alvo_falso"]
+                acusacoes.append({"assunto": alvo_falso,
+                                  "proposicao": f"{alvo_falso} pode estar envolvido nisso.",
+                                  "peso": 0.15})
+                self.mudar_estado("culpa", 0.05 + 0.3 * self.pers["tracos"]["empatia"])
+                self._log(f"{self.nome} desviou a suspeita para {alvo_falso}")
             else:
                 escondeu = True
 
         # 4) Transforma as decisões em instruções concretas para o LLM.
-        if fatos_saida:
-            for fato in fatos_saida:
-                instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato}".')
-        elif escondeu:
-            # Rotação de táticas de evasão: cada vez que este ator esquiva do mesmo
-            # interlocutor, a instrução muda para que as respostas não soem todas iguais.
-            n = self.contagem_esquiva.get(outro, 0)
-            self.contagem_esquiva[outro] = n + 1
-            taticas_esquiva = [
-                f"Você sabe algo sobre isso, mas não quer contar a {outro}. Desvie o assunto sutilmente.",
-                f"Demonstre impaciência ou cansaço com a insistência de {outro}. Deixe claro que já falou o suficiente.",
-                f"Questione por que {outro} está desconfiando de você; sugira que olhe para outros suspeitos.",
-                f"Responda de forma irônica ou desdenhosa à pressão de {outro}, sem revelar nada.",
-            ]
-            instrucoes.append(taticas_esquiva[n % len(taticas_esquiva)])
-        elif sobre_terceiros:  # sabe algo sobre terceiros, mas já contou ou foi o próprio outro quem contou
-            instrucoes.append(f"Você não tem nada novo para contar a {outro} sobre isso. "
-                              f"Reaja ao que {outro} disse.")
-        elif conhecido:  # nada sobre terceiros, mas o reconhecimento (item 1) já dá o que dizer
-            instrucoes.append(f"Reaja ao que {outro} disse.")
-        else:
-            instrucoes.append(f'Você não sabe nada sobre "{topico}". Diga isso e reaja ao que '
-                              f"{outro} disse.")
+        for fato in fatos_saida:
+            instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato}".')
+        for ac in acusacoes:
+            instrucoes.append(f'Sugira, com cautela e sem provas concretas, que {ac["assunto"]} '
+                              f"pode ter algo a ver com isso. Não admita nada sobre você mesmo.")
+        if not fatos_saida and not acusacoes:
+            if escondeu:
+                # Rotação de táticas de evasão: cada vez que este ator esquiva do mesmo
+                # interlocutor, a instrução muda para que as respostas não soem todas iguais.
+                n = self.contagem_esquiva.get(outro, 0)
+                self.contagem_esquiva[outro] = n + 1
+                taticas_esquiva = [
+                    f"Você sabe algo sobre isso, mas não quer contar a {outro}. Desvie o assunto sutilmente.",
+                    f"Demonstre impaciência ou cansaço com a insistência de {outro}. Deixe claro que já falou o suficiente.",
+                    f"Questione por que {outro} está desconfiando de você; sugira que olhe para outros suspeitos.",
+                    f"Responda de forma irônica ou desdenhosa à pressão de {outro}, sem revelar nada.",
+                ]
+                instrucoes.append(taticas_esquiva[n % len(taticas_esquiva)])
+            elif sobre_terceiros:  # sabe algo sobre terceiros, mas já contou ou foi o próprio outro quem contou
+                instrucoes.append(f"Você não tem nada novo para contar a {outro} sobre isso. "
+                                  f"Reaja ao que {outro} disse.")
+            elif conhecido:  # nada sobre terceiros, mas o reconhecimento (item 1) já dá o que dizer
+                instrucoes.append(f"Reaja ao que {outro} disse.")
+            else:
+                instrucoes.append(f'Você não sabe nada sobre "{topico}". Diga isso e reaja ao que '
+                                  f"{outro} disse.")
 
         # 5) Como pedir informação de volta (a menos que seja a última fala).
         tatica = "NENHUMA"
@@ -709,12 +823,14 @@ class Agente:
         self.ultima_decisao[outro] = {
             "tatica": tatica,
             "decisoes": decisoes_debug,
+            "acusacoes": acusacoes,
             "memorias_consultadas": [m["id"] for m in relevantes],
         }
         if self.debug:
             print(self.painel(outro))
 
-        return {"de": self.nome, "alvo": outro, "tatica": tatica, "texto": resposta, "fatos": fatos_saida}
+        return {"de": self.nome, "alvo": outro, "tatica": tatica, "texto": resposta,
+                "fatos": fatos_saida, "acusacoes": acusacoes}
 
     # ------------------------------------------------------------------
     # 4.8) PAINEL DE DEBUG (modo /debug): tudo que o código já calculou,
@@ -755,7 +871,18 @@ class Agente:
                 if dados["memorias_consultadas"]:
                     ids = ", ".join(f"#{i}" for i in dados["memorias_consultadas"])
                     linhas.append(f"MEMÓRIAS CONSULTADAS: {ids}")
+                if dados.get("acusacoes"):
+                    alvos = ", ".join(ac["assunto"] for ac in dados["acusacoes"])
+                    linhas.append(f"DESVIOU A SUSPEITA PARA: {alvos}")
                 linhas.append("")
+
+        objetivos = self.objetivos_ativos()
+        if objetivos:
+            linhas.append("OBJETIVOS")
+            for o in objetivos:
+                linhas.append(f"  {barra(o['prioridade'])}  {o['descricao']} "
+                              f"(progresso {o['progresso']:.0%})")
+            linhas.append("")
 
         crencas = self.listar_crencas()
         if crencas:

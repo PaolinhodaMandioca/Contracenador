@@ -134,6 +134,18 @@ social quanto para hipótese de investigação — o investigador de `/cena` for
 `"<suspeito> é o culpado"` a partir das evidências ligadas por quem ele interroga, e pode vencer por
 **dedução** (confiança ≥ 75%) mesmo sem uma confissão. Veja com `/painel` (seção "HIPÓTESES").
 
+## Objetivos e ações
+
+Além de traços fixos, cada Ator pode ter **objetivos** estruturados (prioridade, progresso, risco,
+status) - não é só uma memória de texto. O Roteirista já dá ao investigador o objetivo dele e ao
+culpado o objetivo "Não ser descoberto".
+
+A antiga decisão REVELAR/ESCONDER/MENTIR (`escolher_acao()` em `Ator.py`) ganhou uma quarta opção,
+**DESVIAR**: quando um objetivo ativo de alta prioridade justifica o risco (e a personalidade
+combina - dissimulação alta, empatia baixa), o código pode fazer o Ator insinuar que um terceiro
+está envolvido, em vez de só mentir ou se esquivar. A acusação vira uma crença fraca em quem ouve
+(inclusive no próprio investigador) - útil para incriminar um inocente, e visível em `/painel`.
+
 ## Limitações conhecidas
 
 - Busca de memória por palavras em comum (sem embeddings): a pergunta precisa usar palavras

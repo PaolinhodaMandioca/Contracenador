@@ -316,6 +316,9 @@ def materializar_cena(dados_cena, pasta_atores="atores", pasta_cenario="cenario"
             # Sensibilidade alta (0.9): é o segredo do crime
             id_mem = ator.lembrar(verdade, origem="sistema", sensibilidade=0.9, compartilhavel=1)
             ator.definir_versao_falsa(id_mem, alibi)
+            # Objetivo estruturado (prioridade/risco altos): é o que libera a ação DESVIAR em
+            # escolher_acao(), não só a personalidade dele - ver Ator.py, seção 4.4.
+            ator.formar_objetivo("Não ser descoberto", prioridade=0.9, risco=0.9)
             print(f"   [Culpado] {nome}: gravada a verdade (memória #{id_mem}) e o álibi pré-gerado.")
 
         elif papel == "investigador":
@@ -324,6 +327,7 @@ def materializar_cena(dados_cena, pasta_atores="atores", pasta_cenario="cenario"
                 # O objetivo serve como memória inicial para guiar a atenção do investigador
                 id_mem = ator.lembrar(f"Objetivo da investigação: {objetivo}",
                                       origem="sistema", sensibilidade=0.2, compartilhavel=1)
+                ator.formar_objetivo(objetivo, prioridade=0.9)
                 print(f"   [Investigador] {nome}: objetivo definido (memória #{id_mem}).")
 
         elif papel == "testemunha":
