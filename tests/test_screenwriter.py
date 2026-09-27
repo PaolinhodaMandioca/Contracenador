@@ -1,0 +1,167 @@
+"""Testes determinísticos do Roteirista (screenwriter.py): validação de JSON, materialização
+da cena (WorldState + Atores) e o uso dos nomes sorteados pelo código. Nenhum LLM de verdade -
+os testes de generate_scene_llm usam um FakeLLM que devolve um JSON fixo."""
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from actor import Actor
+from screenwriter import extract_json, generate_scene_llm, materialize_scene, validate_scene_data
+from world import evidence_for_event, find_event_by_type, open_world
+
+
+class TestExtractJson(unittest.TestCase):
+
+    def test_extracts_from_markdown_fences(self):
+        text = '```json\n{"a": 1}\n```'
+        self.assertEqual(extract_json(text), {"a": 1})
+
+    def test_trims_surrounding_text(self):
+        text = 'Aqui está: {"a": 1} obrigado!'
+        self.assertEqual(extract_json(text), {"a": 1})
+
+    def test_raises_error_without_json(self):
+        with self.assertRaises(ValueError):
+            extract_json("nada de json aqui")
+
+
+class ObedientFakeLLM:
+    """Simula um roteirista que usa exatamente os nomes exigidos no prompt (o caso normal:
+    ver aviso em generate_scene_llm se algum nome sorteado não for usado)."""
+
+    url = "fake"
+
+    def generate(self, messages, **kwargs):
+        content = messages[-1]["content"]
+        names = [n.strip() for n in
+                re.search(r"Use OBRIGATORIAMENTE estes 5 nomes.*?: (.+?)\.", content).group(1).split(",")]
+        characters = [
+            {"name": names[0], "role": "guilty", "truth": "v", "alibi": "a",
+             "description": "d", "examples": [], "traits": {}},
+            {"name": names[1], "role": "investigator", "goal": "o",
+             "description": "d", "examples": [], "traits": {}},
+        ] + [
+            {"name": n, "role": "witness", "saw": None,
+             "description": "d", "examples": [], "traits": {}}
+            for n in names[2:]
+        ]
+        return json.dumps({"scene": "teste", "characters": characters})
+
+
+class DisobedientFakeLLM:
+    """Simula um roteirista que ignora os nomes exigidos e inventa os seus - generate_scene_llm
+    deve seguir em frente mesmo assim (só avisa), nunca travar por isso."""
+
+    url = "fake"
+
+    def generate(self, messages, **kwargs):
+        characters = [
+            {"name": "Fulano Um", "role": "guilty", "truth": "v", "alibi": "a",
+             "description": "d", "examples": [], "traits": {}},
+            {"name": "Fulano Dois", "role": "investigator", "goal": "o",
+             "description": "d", "examples": [], "traits": {}},
+        ]
+        return json.dumps({"scene": "teste", "characters": characters})
+
+
+class TestGenerateSceneLlm(unittest.TestCase):
+    """Os nomes vêm do banco sorteado pelo código (names.py), não da criatividade do LLM - ver
+    generate_scene_llm. O prompt exige que o modelo use exatamente os nomes sorteados."""
+
+    def test_uses_the_5_names_drawn_by_the_code(self):
+        data = generate_scene_llm(ObedientFakeLLM(), "tema qualquer")
+        used_names = [c["name"] for c in data["characters"]]
+        self.assertEqual(len(used_names), 5)
+        self.assertEqual(len(set(used_names)), 5)  # sem repetição
+        for name in used_names:
+            self.assertEqual(len(name.split()), 2)  # "Primeiro Sobrenome"
+
+    def test_llm_that_ignores_the_names_does_not_break_generation(self):
+        data = generate_scene_llm(DisobedientFakeLLM(), "tema qualquer")
+        self.assertEqual(data["characters"][0]["name"], "Fulano Um")
+
+
+class TestValidateSceneData(unittest.TestCase):
+
+    def test_requires_guilty_and_investigator(self):
+        with self.assertRaises(ValueError):
+            validate_scene_data({"scene": "x", "characters": [{"name": "A", "role": "witness"}]})
+
+    def test_fills_default_goal_and_traits(self):
+        data = {"scene": "x", "characters": [
+            {"name": "Joao", "role": "guilty", "truth": "v", "alibi": "a"},
+            {"name": "Ana", "role": "investigator"},
+        ]}
+        validate_scene_data(data)
+        self.assertIn("goal", data["characters"][1])
+        self.assertEqual(data["characters"][0]["traits"]["honesty"], 0.5)
+
+
+class TestMaterializeScene(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="contracenador_screenwriter_")
+        self.actors_folder = os.path.join(self.tmp, "atores")
+        self.scenario_folder = os.path.join(self.tmp, "cenario")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_records_crime_and_evidence_in_the_worldstate(self):
+        data = {
+            "scene": "Uma joia sumiu",
+            "characters": [
+                {"name": "Joao", "role": "guilty", "truth": "Joao pegou a joia.",
+                 "alibi": "Estava no jardim.", "traits": {}, "examples": []},
+                {"name": "Ana", "role": "investigator", "goal": "Achar a joia",
+                 "traits": {}, "examples": []},
+                {"name": "Bia", "role": "witness", "saw": "Vi Joao perto da vitrine.",
+                 "traits": {}, "examples": []},
+            ],
+        }
+        validate_scene_data(data)
+        materialize_scene(data, actors_folder=self.actors_folder,
+                          scenario_folder=self.scenario_folder, slots=2)
+
+        world = open_world(os.path.join(self.scenario_folder, "world.db"))
+        try:
+            event = find_event_by_type(world, "crime")
+            self.assertIsNotNone(event)
+            self.assertEqual(event["data"]["proposition"], "Joao pegou a joia.")
+
+            evidence = evidence_for_event(world, event["id"])
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["subject"], "Joao")
+            self.assertEqual(evidence[0]["origin"], "Bia")
+        finally:
+            world.close()
+
+    def test_guilty_and_investigator_get_structured_goals(self):
+        data = {
+            "scene": "Uma joia sumiu",
+            "characters": [
+                {"name": "Joao", "role": "guilty", "truth": "Joao pegou a joia.",
+                 "alibi": "Estava no jardim.", "traits": {}, "examples": []},
+                {"name": "Ana", "role": "investigator", "goal": "Achar a joia",
+                 "traits": {}, "examples": []},
+            ],
+        }
+        validate_scene_data(data)
+        materialize_scene(data, actors_folder=self.actors_folder,
+                          scenario_folder=self.scenario_folder, slots=2)
+
+        joao = Actor(os.path.join(self.actors_folder, "joao.db"), slot=0)
+        self.assertIsNotNone(joao.goal("Não ser descoberto"))
+
+        ana = Actor(os.path.join(self.actors_folder, "ana.db"), slot=0)
+        self.assertIsNotNone(ana.goal("Achar a joia"))
+
+
+if __name__ == "__main__":
+    unittest.main()

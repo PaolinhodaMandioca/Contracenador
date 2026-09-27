@@ -6,48 +6,48 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from apoio import TesteComAtores
+from support import ActorTestCase
 
-from main import _consumir_nome_ator
+from main import _consume_actor_name
 
 
-class TestConsumirNomeAtor(TesteComAtores):
+class TestConsumeActorName(ActorTestCase):
     """Bug real: /conversar só reconhecia nomes de uma palavra, mas o Roteirista sempre gera
-    'Nome Sobrenome'. _consumir_nome_ator precisa casar nomes de várias palavras."""
+    'Nome Sobrenome'. _consume_actor_name precisa casar nomes de várias palavras."""
 
     def setUp(self):
         super().setUp()
-        self.atores = {
-            "ana carvalho": self.criar_ator("Ana Carvalho"),
-            "joão silva": self.criar_ator("João Silva"),
-            "bia": self.criar_ator("Bia"),
+        self.actors = {
+            "ana carvalho": self.create_actor("Ana Carvalho"),
+            "joão silva": self.create_actor("João Silva"),
+            "bia": self.create_actor("Bia"),
         }
 
-    def test_reconhece_nome_de_duas_palavras(self):
-        ator, resto = _consumir_nome_ator("Ana Carvalho João Silva o roubo", self.atores)
-        self.assertEqual(ator.nome, "Ana Carvalho")
-        self.assertEqual(resto, "João Silva o roubo")
+    def test_recognizes_a_two_word_name(self):
+        actor, rest = _consume_actor_name("Ana Carvalho João Silva o roubo", self.actors)
+        self.assertEqual(actor.name, "Ana Carvalho")
+        self.assertEqual(rest, "João Silva o roubo")
 
-    def test_reconhece_nome_de_uma_palavra(self):
-        ator, resto = _consumir_nome_ator("Bia o roubo", self.atores)
-        self.assertEqual(ator.nome, "Bia")
-        self.assertEqual(resto, "o roubo")
+    def test_recognizes_a_one_word_name(self):
+        actor, rest = _consume_actor_name("Bia o roubo", self.actors)
+        self.assertEqual(actor.name, "Bia")
+        self.assertEqual(rest, "o roubo")
 
-    def test_encadeia_dois_nomes_e_sobra_o_topico(self):
-        a, resto = _consumir_nome_ator("Ana Carvalho João Silva o roubo da joia", self.atores)
-        b, resto = _consumir_nome_ator(resto, self.atores)
-        self.assertEqual(a.nome, "Ana Carvalho")
-        self.assertEqual(b.nome, "João Silva")
-        self.assertEqual(resto, "o roubo da joia")
+    def test_chains_two_names_and_leaves_the_topic(self):
+        a, rest = _consume_actor_name("Ana Carvalho João Silva o roubo da joia", self.actors)
+        b, rest = _consume_actor_name(rest, self.actors)
+        self.assertEqual(a.name, "Ana Carvalho")
+        self.assertEqual(b.name, "João Silva")
+        self.assertEqual(rest, "o roubo da joia")
 
-    def test_ignora_acentos_e_maiuscula(self):
-        ator, resto = _consumir_nome_ator("joao silva o roubo", self.atores)
-        self.assertEqual(ator.nome, "João Silva")
+    def test_ignores_accents_and_case(self):
+        actor, rest = _consume_actor_name("joao silva o roubo", self.actors)
+        self.assertEqual(actor.name, "João Silva")
 
-    def test_nao_casa_nome_desconhecido(self):
-        ator, resto = _consumir_nome_ator("Fulano de Tal algo", self.atores)
-        self.assertIsNone(ator)
-        self.assertEqual(resto, "Fulano de Tal algo")
+    def test_does_not_match_an_unknown_name(self):
+        actor, rest = _consume_actor_name("Fulano de Tal algo", self.actors)
+        self.assertIsNone(actor)
+        self.assertEqual(rest, "Fulano de Tal algo")
 
 
 if __name__ == "__main__":
