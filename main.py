@@ -564,8 +564,9 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
                 registrar_evento(mundo, "ameaca", ator=env["de"], alvo=env.get("alvo"),
                                   local="cena", dados={"proposicao": f'{env["de"]} ameaçou {env.get("alvo")}'})
         if envelope_resposta.get("fatos"):
+            textos_revelados = [f["texto"] for f in envelope_resposta["fatos"]]
             registrar_evento(mundo, "revelacao", ator=alvo.nome, alvo=investigador.nome,
-                              local="cena", dados={"proposicao": "; ".join(envelope_resposta["fatos"])})
+                              local="cena", dados={"proposicao": "; ".join(textos_revelados)})
 
             # 3c) Crenças: o que o Roteirista ligou como evidência de {alvo} (mundo.db) vira
             # reforço na hipótese "<assunto> é o culpado" do investigador. Investigador não
@@ -587,14 +588,17 @@ def cmd_cena(atores, resto, pasta_cenario, llm):
                 vitoria = True
                 break
 
-        # 4) Plateia: os outros presentes na sala escutam tudo
+        # 4) Plateia: os outros presentes na sala escutam tudo. receber() já grava a memória
+        # (e já detecta contradição, se houver); aqui só marcamos de quem é o assunto, já que
+        # receber() não sabe que este fato específico é sobre o caso do culpado.
         ouvintes = [a for a in suspeitos if a is not alvo]
         for ouvinte in ouvintes:
             ouvinte.receber(envelope_pergunta)
             ouvinte.receber(envelope_resposta)
-            # Se fatos foram revelados sobre o caso, registra para os ouvintes
             for fato in envelope_resposta.get("fatos", []):
-                ouvinte.lembrar(fato, origem=alvo.nome, sensibilidade=0.5, sobre=culpado.nome)
+                id_mem = ouvinte.memoria_id_por_texto(fato["texto"])
+                if id_mem:
+                    ouvinte.definir_sobre(id_mem, culpado.nome)
 
         # 5) Fim Dinâmico: checa se a verdade entrou na memória do investigador
         memorias_inv = [m["texto"].strip() for m in investigador.listar_memorias()]

@@ -146,14 +146,24 @@ combina - dissimulação alta, empatia baixa), o código pode fazer o Ator insin
 está envolvido, em vez de só mentir ou se esquivar. A acusação vira uma crença fraca em quem ouve
 (inclusive no próprio investigador) - útil para incriminar um inocente, e visível em `/painel`.
 
+## Contradições
+
+Cada fato que um Ator recebe de outro carrega o id da memória ORIGINAL de quem contou
+(`origem_id`). Se a mesma origem contar algo DIFERENTE sobre o mesmo `origem_id` depois (ex.:
+mentiu e mais tarde, sob pressão, confessou), quem ouviu as duas versões percebe a contradição:
+perde confiança nela, a desconfiança sobe, e as duas memórias ficam marcadas — visível em
+`/painel` (seção "CONTRADIÇÕES PEGAS").
+
 ## Limitações conhecidas
 
 - Busca de memória por palavras em comum (sem embeddings): a pergunta precisa usar palavras
   parecidas com as do fato.
 - Histórico, posturas e "quem já contou o quê" vivem só na RAM (somem ao fechar). Fatos, emoções,
   relações e crenças ficam no `.db`.
-- Contradições não são detectadas (se um Ator mente e depois confessa, o outro fica com as duas
-  versões).
+- Contradição só é detectada quando é a MESMA origem mudando de versão sobre o MESMO fato (ex.:
+  mentiu e depois confessou) - a confiança nela cai e a memória fica marcada (ver `/painel`). Duas
+  testemunhas diferentes discordando uma da outra sobre o mesmo assunto não é pego ainda: exigiria
+  comparar texto livre semanticamente (memória semântica, ainda não implementada).
 - Só existe 1 local por cenário ainda: a percepção automática por local (em `mundo.py`) só é usada
   para eventos durante a cena, não para decidir quem viu o crime inicial (isso continua vindo do
   campo `viu` gerado pelo Roteirista).

@@ -70,7 +70,13 @@ CREATE TABLE IF NOT EXISTS memorias (
     compartilhavel INTEGER DEFAULT 1,       -- 0 = nunca sai deste agente
     sensibilidade  REAL DEFAULT 0.3,        -- 0 = qualquer um pode saber ... 1 = segredo
     versao_falsa   TEXT,                    -- versão pré-gerada, usada só quando ele mentir
-    sobre          TEXT                     -- nome de quem é o assunto (ex.: outro agente), se houver
+    sobre          TEXT,                    -- nome de quem é o assunto (ex.: outro agente), se houver
+    origem_id      INTEGER,                 -- id da memória ORIGINAL de quem contou (mesmo fato-base
+                                             -- na cabeça de quem contou); permite notar quando ela
+                                             -- muda de versão sobre a MESMA coisa - ver detectar
+                                             -- contradição em receber()
+    contraditoria  INTEGER DEFAULT 0        -- 1 = essa memória entrou em conflito com outra já
+                                             -- registrada da mesma origem sobre o mesmo origem_id
 );
 
 CREATE TABLE IF NOT EXISTS estado (
@@ -136,6 +142,13 @@ def _migrar(db):
     if "sobre" not in colunas:
         db.execute("ALTER TABLE memorias ADD COLUMN sobre TEXT")
         db.execute("PRAGMA user_version = 2")
+        db.commit()
+        colunas.add("sobre")
+    if "origem_id" not in colunas:
+        db.execute("ALTER TABLE memorias ADD COLUMN origem_id INTEGER")
+        db.commit()
+    if "contraditoria" not in colunas:
+        db.execute("ALTER TABLE memorias ADD COLUMN contraditoria INTEGER DEFAULT 0")
         db.commit()
 
 
@@ -245,19 +258,33 @@ class Agente:
     # 4.1) MEMÓRIA: salvar e buscar fatos
     # ------------------------------------------------------------------
 
-    def lembrar(self, texto, origem="usuario", sensibilidade=0.3, compartilhavel=1, sobre=None):
-        """Salva um fato. Gravar é só um INSERT (não reescreve o arquivo inteiro).
-        `sobre` é o nome de quem é o assunto do fato (ex.: outro agente) - ver sabe_sobre()."""
+    def lembrar(self, texto, origem="usuario", sensibilidade=0.3, compartilhavel=1, sobre=None,
+                origem_id=None):
+        """
+        Salva um fato. Gravar é só um INSERT (não reescreve o arquivo inteiro).
+        `sobre` é o nome de quem é o assunto do fato (ex.: outro agente) - ver sabe_sobre().
+        `origem_id` é o id da memória ORIGINAL na cabeça de quem contou (mesmo fato-base) -
+        permite notar quando a mesma origem muda de versão sobre a mesma coisa, ver receber().
+        """
         texto = texto.strip()
         existente = self.db.execute("SELECT id FROM memorias WHERE texto=?", (texto,)).fetchone()
         if existente:  # não duplica o mesmo fato
             return existente["id"]
         cursor = self.db.execute(
-            "INSERT INTO memorias(texto, data, origem, compartilhavel, sensibilidade, sobre) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (texto, time.time(), origem, compartilhavel, sensibilidade, sobre))
+            "INSERT INTO memorias(texto, data, origem, compartilhavel, sensibilidade, sobre, origem_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (texto, time.time(), origem, compartilhavel, sensibilidade, sobre, origem_id))
         self.db.commit()
         return cursor.lastrowid
+
+    def memoria_id_por_texto(self, texto):
+        linha = self.db.execute("SELECT id FROM memorias WHERE texto=?", (texto.strip(),)).fetchone()
+        return linha["id"] if linha else None
+
+    def contradicoes(self, k=5):
+        """Memórias marcadas como contraditórias (ver receber()), da mais recente pra mais antiga."""
+        return [dict(m) for m in self.db.execute(
+            "SELECT * FROM memorias WHERE contraditoria=1 ORDER BY id DESC LIMIT ?", (k,))]
 
     def recordar(self, consulta, k=3, so_compartilhaveis=False):
         """
@@ -652,12 +679,21 @@ class Agente:
     # ------------------------------------------------------------------
     # 4.7) CONVERSA COM OUTRO AGENTE (o orquestrador faz de "carteiro")
     #
-    # Cada fala viaja num ENVELOPE: {"de", "tatica", "texto", "fatos"}
-    #   texto -> o que foi dito (escrito pelo LLM)
-    #   fatos -> as informações que o código decidiu passar (verdadeiras ou falsas)
-    #   tatica-> a intenção da fala (PEDIR, AMEACAR ou NENHUMA)
+    # Cada fala viaja num ENVELOPE: {"de", "alvo", "tatica", "texto", "fatos", "acusacoes"}
+    #   texto      -> o que foi dito (escrito pelo LLM)
+    #   fatos      -> [{"texto", "origem_id"}] as informações que o código decidiu passar
+    #                 (verdadeiras ou falsas); origem_id identifica o fato-base na cabeça de
+    #                 quem contou, e é o que permite notar quando ele muda de versão depois
+    #                 (ver detecção de contradição em receber())
+    #   acusacoes  -> [{"assunto", "proposicao", "peso"}] insinuações da ação DESVIAR
+    #   tatica     -> a intenção da fala (PEDIR, AMEACAR ou NENHUMA)
     # Assim o outro agente atualiza medo/memória por CÓDIGO, sem gastar inferência para
     # "interpretar" a fala. Um agente nunca enxerga o banco nem o prompt do outro.
+    #
+    # ESCOPO: só detectamos contradição quando é a MESMA origem mudando de versão sobre o
+    # MESMO fato (origem_id bate). Duas testemunhas diferentes discordando uma da outra sobre
+    # o mesmo assunto não é pego aqui - isso exigiria comparar texto livre semanticamente
+    # (roadmap, seção 8: memória semântica), o que é trabalho futuro.
     # ------------------------------------------------------------------
 
     def nova_conversa(self, outro):
@@ -700,12 +736,31 @@ class Agente:
                 self.mudar_relacao(outro, desconfianca=0.15, confianca=-0.05)
                 self._log(f"{self.nome} presenciou {outro} ameacando {alvo}: desconfiança de {outro} subiu")
 
-        # (b) Informação recebida vira memória MINHA, com origem = quem contou. Quem
-        #     conta ganha um pouco de confiança, e eu passo a dever um favor.
+        # (b) Informação recebida vira memória MINHA, com origem = quem contou. Antes de
+        #     guardar, checo se {outro} já me disse algo DIFERENTE sobre o mesmo fato-base
+        #     (mesmo origem_id) - é a detecção de contradição (roadmap, seção 14). Se bateu,
+        #     ele perde confiança em vez de ganhar; senão, quem conta ganha um pouco de
+        #     confiança e eu passo a dever um favor.
         for fato in env.get("fatos", []):
-            self.lembrar(fato, origem=outro, sensibilidade=0.5)
-            self.mudar_relacao(outro, confianca=0.05, favor_devido=0.1)
-            self._log(f"{self.nome} aprendeu com {outro}: {fato!r}")
+            texto, origem_id = fato["texto"], fato.get("origem_id")
+            anterior = None
+            if origem_id is not None:
+                anterior = self.db.execute(
+                    "SELECT * FROM memorias WHERE origem=? AND origem_id=? AND texto!=? "
+                    "ORDER BY id DESC LIMIT 1", (outro, origem_id, texto)).fetchone()
+
+            id_mem = self.lembrar(texto, origem=outro, sensibilidade=0.5, origem_id=origem_id)
+
+            if anterior is not None:
+                self.db.execute("UPDATE memorias SET contraditoria=1 WHERE id IN (?, ?)",
+                                (anterior["id"], id_mem))
+                self.db.commit()
+                self.mudar_relacao(outro, desconfianca=0.3, confianca=-0.2)
+                self._log(f"{self.nome} pegou {outro} se contradizendo: antes disse "
+                          f"{anterior['texto']!r}, agora diz {texto!r}")
+            else:
+                self.mudar_relacao(outro, confianca=0.05, favor_devido=0.1)
+                self._log(f"{self.nome} aprendeu com {outro}: {texto!r}")
 
         # (b2) Acusações (ação DESVIAR, ver escolher_acao): reforçam uma CRENÇA meu sobre o
         #      acusado, não uma memória de fato consumado - é só a palavra de {outro} contra
@@ -760,11 +815,13 @@ class Agente:
                       f"sobre: {fato['texto']!r}")
             decisoes_debug.append((fato["texto"], decisao, p))
             if decisao == "REVELAR":
-                fatos_saida.append(fato["texto"])
+                fatos_saida.append({"texto": fato["texto"], "origem_id": fato["id"]})
                 self.contados.add((outro, fato["id"]))
             elif decisao == "MENTIR":
-                # O prompt recebe SÓ a versão falsa: a verdade não entra nele.
-                fatos_saida.append(fato["versao_falsa"])
+                # O prompt recebe SÓ a versão falsa: a verdade não entra nele. origem_id é o
+                # MESMO da verdade (é o mesmo fato-base) - se este Ator revelar a verdade sobre
+                # ele depois, quem ouviu as duas versões pega a contradição (ver receber()).
+                fatos_saida.append({"texto": fato["versao_falsa"], "origem_id": fato["id"]})
                 self.mudar_estado("culpa", 0.1 + 0.4 * self.pers["tracos"]["empatia"])  # empatia = mais culpa
             elif decisao == "DESVIAR":
                 alvo_falso = extra["alvo_falso"]
@@ -778,7 +835,7 @@ class Agente:
 
         # 4) Transforma as decisões em instruções concretas para o LLM.
         for fato in fatos_saida:
-            instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato}".')
+            instrucoes.append(f'Conte a {outro}, com suas palavras: "{fato["texto"]}".')
         for ac in acusacoes:
             instrucoes.append(f'Sugira, com cautela e sem provas concretas, que {ac["assunto"]} '
                               f"pode ter algo a ver com isso. Não admita nada sobre você mesmo.")
@@ -889,6 +946,13 @@ class Agente:
             linhas.append("HIPÓTESES / CRENÇAS")
             for c in crencas:
                 linhas.append(f"  {barra(c['confianca'])}  {c['proposicao']}")
+            linhas.append("")
+
+        contradicoes = self.contradicoes()
+        if contradicoes:
+            linhas.append("CONTRADIÇÕES PEGAS")
+            for c in contradicoes:
+                linhas.append(f"  {c['origem']} disse: {c['texto']!r}")
             linhas.append("")
 
         linhas.append("━" * (2 * largura + len(self.nome) + 2))
