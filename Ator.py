@@ -282,10 +282,10 @@ class Agente:
             expressao = " OR ".join(f'"{termo}"*' for termo in sorted(procuradas))
             filtro = " AND m.compartilhavel=1" if so_compartilhaveis else ""
             sql = (
-                "SELECT m.*, bm25(memorias_fts) AS relevancia "
+                "SELECT m.* "
                 "FROM memorias_fts JOIN memorias AS m ON m.id=memorias_fts.rowid "
                 "WHERE memorias_fts MATCH ?" + filtro +
-                " ORDER BY relevancia ASC, m.data DESC, m.id DESC LIMIT ?"
+                " ORDER BY bm25(memorias_fts) ASC, m.data DESC, m.id DESC LIMIT ?"
             )
             try:
                 linhas = self.db.execute(sql, (expressao, k)).fetchall()
