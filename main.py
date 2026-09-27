@@ -23,6 +23,7 @@ import random
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import colors
@@ -61,6 +62,7 @@ class ServerManager:
         self.threads   = threads    # None = llama-server decide sozinho
         self.embedding = embedding  # liga o endpoint de embedding (memória semântica, actor.py)
         self._proc     = None
+        self._log_file = None  # arquivo temporário com stdout+stderr do llama-server (ver start())
 
     # ------------------------------------------------------------------
     # API pública
@@ -78,10 +80,16 @@ class ServerManager:
         flags = 0
         if sys.platform == "win32":
             flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        # stdout/stderr vão pra um arquivo temporário (em vez de DEVNULL): se o processo
+        # morrer antes de ficar pronto, _wait_ready() mostra as últimas linhas em vez de só
+        # dizer "verifique RAM/modelo" às cegas - bug real: a causa verdadeira (porta já em
+        # uso por outro programa) ficava completamente escondida do usuário.
+        self._log_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix=f"contracenador_llama_{self.port}_", suffix=".log", delete=False)
         self._proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
             creationflags=flags,
         )
         self._wait_ready()
@@ -98,6 +106,26 @@ class ServerManager:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
+        if self._log_file is not None:
+            self._log_file.close()
+            try:
+                os.remove(self._log_file.name)
+            except OSError:
+                pass
+            self._log_file = None
+
+    def _last_log_lines(self, n=15):
+        """Últimas linhas do log do llama-server desta sessão - usado pra dar um erro útil em
+        vez de só um "algo deu errado" quando o processo morre cedo (ver start()/_wait_ready)."""
+        if self._log_file is None:
+            return ""
+        try:
+            self._log_file.flush()
+            with open(self._log_file.name, "r", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-n:]).strip()
+        except OSError:
+            return ""
 
     def url(self):
         return f"http://127.0.0.1:{self.port}"
@@ -144,8 +172,12 @@ class ServerManager:
             print(".", end="", flush=True)
             if self._proc.poll() is not None:
                 print()
-                raise RuntimeError("O llama-server encerrou antes de ficar pronto. "
-                                   "Verifique se o modelo existe e se há RAM suficiente.")
+                details = self._last_log_lines()
+                hint = f"\n\nÚltimas linhas do log:\n{details}" if details else ""
+                raise RuntimeError(
+                    "O llama-server encerrou antes de ficar pronto. Verifique se o modelo "
+                    f"existe, se há RAM suficiente e se a porta {self.port} já não está sendo "
+                    f"usada por outro programa.{hint}")
             try:
                 with urllib.request.urlopen(health_url, timeout=3) as r:
                     data = json.load(r)
@@ -646,8 +678,12 @@ def main():
         ),
     )
     # Portas
-    parser.add_argument("--porta-atores",      type=int, default=8080, help="Porta do servidor 7B (padrão: 8080)")
-    parser.add_argument("--porta-roteirista",  type=int, default=8081, help="Porta do servidor 14B (padrão: 8081)")
+    # 8080/8081 evitados de propósito: em algumas máquinas (ex.: SteamOS/Bazzite, onde o
+    # Chromium interno do Steam usa --remote-debugging-port=8080 o tempo todo) essas portas já
+    # vêm ocupadas por outro programa, e o llama-server morre silenciosamente ao tentar subir
+    # nelas - bug real observado pelo usuário.
+    parser.add_argument("--porta-atores",      type=int, default=8090, help="Porta do servidor 7B (padrão: 8090)")
+    parser.add_argument("--porta-roteirista",  type=int, default=8091, help="Porta do servidor 14B (padrão: 8091)")
     # Outros
     parser.add_argument("--slots",   type=int, default=2,  help="Número de slots KV do llama-server (padrão: 2)")
     parser.add_argument("--threads", type=int, default=None, help="Número de threads de CPU do llama-server (padrão: automático)")

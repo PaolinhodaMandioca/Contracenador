@@ -61,7 +61,7 @@ python main.py --modelo-atores Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
 | Flag | Efeito |
 |---|---|
 | `--modelo-atores` / `--modelo-roteirista` | Repositório HF (`Org/Repo:arquivo.gguf`) ou caminho local `.gguf` |
-| `--porta-atores` / `--porta-roteirista` | Portas dos dois servidores (padrão 8080/8081) |
+| `--porta-atores` / `--porta-roteirista` | Portas dos dois servidores (padrão 8090/8091 - evita 8080/8081 porque em algumas máquinas, como SteamOS/Bazzite, essas portas já vêm ocupadas pelo próprio sistema) |
 | `--slots` | Nº de slots KV do llama-server dos Atores (cada Ator sempre usa o mesmo slot) |
 | `--threads` | Núcleos de CPU (padrão: automático) |
 | `--pasta` / `--cenario` | Pastas dos `.db` dos Atores e do `cena.json` |
