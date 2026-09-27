@@ -169,6 +169,8 @@ Comandos (qualquer outro texto é uma mensagem para o ator atual):
   /falsa <id> <texto>         escreve à mão a versão falsa da memória <id> (a que ele conta ao mentir)
   /sobre <id> <nome>          diz de quem é a memória <id> (ex.: /sobre 3 Marcos); sem nome remove
   /estado                     mostra traços, emoções e relações do ator atual
+  /painel [outro]             mostra o painel de debug do ator atual (emoções, traços, probabilidades)
+  /debug                      liga/desliga o painel de debug automático após cada resposta
   /tracos <traco> <0 a 1>     muda um traço do ator atual (ex.: /tracos honestidade 0.2)
   /novo <nome>                cria um ator novo avulso (um arquivo .db novo)
   /conversar <A> <B> <tópico> faz A e B conversarem entre si sobre o tópico (1 para 1)
@@ -665,6 +667,7 @@ def main():
         atores = carregar_atores(args.pasta, args.slots)
         atual = next(iter(atores.values()))
         turnos = 4
+        debug_ativo = False
         print(AJUDA)
 
         while True:
@@ -699,6 +702,8 @@ def main():
                     # Após /roteiro o 7B voltou: recria o cliente LLM apontando para ele
                     llm = LLM(srv_atores.url())
                     atual = next(iter(atores.values()))
+                    for ag in atores.values():
+                        ag.debug = debug_ativo
                 elif comando == "/falar":
                     if resto.lower() in atores:
                         atual = atores[resto.lower()]
@@ -714,10 +719,22 @@ def main():
                     cmd_sobre(atual, resto)
                 elif comando == "/estado":
                     print(atual.resumo())
+                elif comando == "/painel":
+                    outro = resto.strip() or None
+                    if outro and outro.lower() not in atores:
+                        outro = None
+                    print(atual.painel(outro))
+                elif comando == "/debug":
+                    debug_ativo = not debug_ativo
+                    for ag in atores.values():
+                        ag.debug = debug_ativo
+                    print(f"   Modo debug: {'ligado' if debug_ativo else 'desligado'}.")
                 elif comando == "/tracos":
                     cmd_tracos(atual, resto)
                 elif comando == "/novo":
                     cmd_novo(args.pasta, resto, atores, args.slots)
+                    for ag in atores.values():
+                        ag.debug = debug_ativo
                 elif comando == "/turnos":
                     turnos = max(1, int(resto)) if resto.isdigit() else turnos
                     print(f"   Conversas entre atores terão {turnos} falas.")

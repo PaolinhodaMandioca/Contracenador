@@ -143,6 +143,13 @@ def limitar(valor, minimo=0.0, maximo=1.0):
     return max(minimo, min(maximo, valor))
 
 
+def barra(valor, largura=10):
+    """Barra de progresso textual para o painel de debug (ex.: '███████░░░ 0.71')."""
+    valor = limitar(valor)
+    cheio = round(valor * largura)
+    return "█" * cheio + "░" * (largura - cheio) + f" {valor:.2f}"
+
+
 # Palavras que não ajudam a achar memórias parecidas.
 PALAVRAS_COMUNS = {
     "que", "com", "por", "para", "pra", "uma", "dos", "das", "nos", "nas", "mas", "como",
@@ -192,6 +199,8 @@ class Agente:
         self.aguardando = False  # True se o último passo foi pedir algo e a resposta ainda não veio
         self.mostrar = True      # imprime no terminal as decisões internas (bom para ajustar pesos)
         self.contagem_esquiva = {}  # interlocutor -> nº de vezes que desviei (roda táticas de evasão)
+        self.debug = False       # modo debug: imprime o painel completo após cada resposta
+        self.ultima_decisao = {} # interlocutor -> dados do último turno (para o painel de debug)
 
     def _log(self, mensagem):
         if self.mostrar:
@@ -555,11 +564,12 @@ class Agente:
                      if (outro, m["id"]) not in self.contados and m["origem"] != outro][:2]
 
         # 3) Para cada fato sobre terceiros, o CÓDIGO decide REVELAR, ESCONDER ou MENTIR.
-        fatos_saida, escondeu = [], False
+        fatos_saida, escondeu, decisoes_debug = [], False, []
         for fato in pendentes:
             decisao, p = self.decidir(fato, outro)
             self._log(f"{self.nome} decidiu {decisao} (chance de revelar: {p:.0%}) "
                       f"sobre: {fato['texto']!r}")
+            decisoes_debug.append((fato["texto"], decisao, p))
             if decisao == "REVELAR":
                 fatos_saida.append(fato["texto"])
                 self.contados.add((outro, fato["id"]))
@@ -610,10 +620,63 @@ class Agente:
                  + "\n".join(f"- {i}" for i in instrucoes))
         resposta = self._falar(self._mensagens(outro, final), llm)
         self._guardar_historico(outro, ouviu, resposta)
+
+        self.ultima_decisao[outro] = {
+            "tatica": tatica,
+            "decisoes": decisoes_debug,
+            "memorias_consultadas": [m["id"] for m in relevantes],
+        }
+        if self.debug:
+            print(self.painel(outro))
+
         return {"de": self.nome, "alvo": outro, "tatica": tatica, "texto": resposta, "fatos": fatos_saida}
 
     # ------------------------------------------------------------------
-    # 4.8) RESUMO para o terminal
+    # 4.8) PAINEL DE DEBUG (modo /debug): tudo que o código já calculou,
+    # só formatado em barras. Nenhuma chamada ao LLM.
+    # ------------------------------------------------------------------
+
+    def painel(self, outro=None):
+        t = self.pers["tracos"]
+        largura = 22
+        linhas = [f"{'━' * largura} {self.nome.upper()} {'━' * largura}", ""]
+
+        linhas.append("EMOÇÕES")
+        linhas.append(f"  culpa       {barra(self.estado('culpa'))}")
+        linhas.append(f"  frustração  {barra(self.estado('frustracao'))}")
+        linhas.append("")
+
+        linhas.append("TRAÇOS")
+        for chave, valor in t.items():
+            linhas.append(f"  {chave:<13} {barra(valor)}")
+        linhas.append("")
+
+        if outro:
+            r = self.relacao(outro)
+            linhas.append(f"RELAÇÃO COM {outro.upper()}")
+            linhas.append(f"  confiança     {barra(r['confianca'])}")
+            linhas.append(f"  medo          {barra(r['medo'])}")
+            linhas.append(f"  desconfiança  {barra(r['desconfianca'])}")
+            linhas.append(f"  favor devido  {barra(r['favor_devido'])}")
+            linhas.append("")
+
+            dados = self.ultima_decisao.get(outro)
+            if dados:
+                linhas.append(f"ÚLTIMA TÁTICA: {dados['tatica']}")
+                if dados["decisoes"]:
+                    linhas.append("PROBABILIDADES (chance de revelar)")
+                    for texto, decisao, p in dados["decisoes"]:
+                        linhas.append(f"  [{decisao:<8}] {barra(p)}  {texto[:40]!r}")
+                if dados["memorias_consultadas"]:
+                    ids = ", ".join(f"#{i}" for i in dados["memorias_consultadas"])
+                    linhas.append(f"MEMÓRIAS CONSULTADAS: {ids}")
+                linhas.append("")
+
+        linhas.append("━" * (2 * largura + len(self.nome) + 2))
+        return "\n".join(linhas)
+
+    # ------------------------------------------------------------------
+    # 4.9) RESUMO para o terminal
     # ------------------------------------------------------------------
 
     def resumo(self):
