@@ -96,6 +96,7 @@ def abrir_banco(caminho):
     if db.execute("PRAGMA user_version").fetchone()[0] == 0:
         db.executescript(MARCA)
     _migrar(db)
+    _migrar_fts5(db)
     return db
 
 
@@ -107,6 +108,52 @@ def _migrar(db):
         db.execute("ALTER TABLE memorias ADD COLUMN sobre TEXT")
         db.execute("PRAGMA user_version = 2")
         db.commit()
+
+
+def _migrar_fts5(db):
+    """Cria e mantém o índice FTS5. Em SQLite sem FTS5, a busca lexical antiga continua disponível."""
+    try:
+        db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memorias_fts "
+            "USING fts5(texto, content='memorias', content_rowid='id', "
+            "tokenize='unicode61 remove_diacritics 2')"
+        )
+        db.executescript("""
+        CREATE TRIGGER IF NOT EXISTS memorias_fts_ai AFTER INSERT ON memorias BEGIN
+            INSERT INTO memorias_fts(rowid, texto) VALUES (new.id, new.texto);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memorias_fts_ad AFTER DELETE ON memorias BEGIN
+            INSERT INTO memorias_fts(memorias_fts, rowid, texto)
+            VALUES ('delete', old.id, old.texto);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memorias_fts_au AFTER UPDATE OF texto ON memorias BEGIN
+            INSERT INTO memorias_fts(memorias_fts, rowid, texto)
+            VALUES ('delete', old.id, old.texto);
+            INSERT INTO memorias_fts(rowid, texto) VALUES (new.id, new.texto);
+        END;
+        """)
+    except sqlite3.OperationalError as erro:
+        if "no such module: fts5" in str(erro).lower():
+            return False
+        raise
+
+    pronto = db.execute(
+        "SELECT valor FROM config WHERE chave='fts5_pronto'"
+    ).fetchone()
+    if pronto is None or pronto["valor"] != "1":
+        # Indexa memórias já existentes ao atualizar um banco antigo.
+        db.execute("INSERT INTO memorias_fts(memorias_fts) VALUES ('rebuild')")
+        db.execute(
+            "INSERT OR REPLACE INTO config(chave, valor) VALUES ('fts5_pronto', '1')"
+        )
+        db.commit()
+    return True
+
+
+def _fts5_disponivel(db):
+    return db.execute(
+        "SELECT 1 FROM config WHERE chave='fts5_pronto' AND valor='1'"
+    ).fetchone() is not None
 
 
 def criar_ator(caminho, nome, descricao, exemplos, tracos):
@@ -178,6 +225,7 @@ class Agente:
         self.caminho = caminho
         self.slot = slot  # slot do llama-server reservado a este agente (cache do prefixo)
         self.db = abrir_banco(caminho)
+        self.fts5_disponivel = _fts5_disponivel(self.db)
         linha = self.db.execute("SELECT valor FROM config WHERE chave='personalidade'").fetchone()
         if linha is None:
             raise ValueError(f"{caminho} não tem personalidade. Crie o agente com criar_ator().")
@@ -222,14 +270,30 @@ class Agente:
 
     def recordar(self, consulta, k=3, so_compartilhaveis=False):
         """
-        Devolve até k memórias parecidas com a consulta (mais palavras em comum = melhor;
-        empate = a mais recente). Só as poucas memórias relevantes entram no prompt, e é
-        isso que mantém o contexto curto (e o modelo pequeno).
-        `so_compartilhaveis=True` é o FILTRO DE ISOLAMENTO: nas conversas com outros
-        agentes, o que é privado nem é lido do banco, então não tem como vazar.
-        (Evolução futura: trocar por FTS5 ou embeddings pequenos + sqlite-vec.)
+        Devolve até k memórias relevantes por FTS5; sem suporte a FTS5, usa a busca
+        lexical simples. Só as memórias relevantes entram no prompt, mantendo o contexto
+        curto. `so_compartilhaveis=True` preserva o filtro de isolamento entre agentes.
         """
         procuradas = palavras(consulta)
+        if not procuradas:
+            return []
+
+        if self.fts5_disponivel:
+            expressao = " OR ".join(f'"{termo}"*' for termo in sorted(procuradas))
+            filtro = " AND m.compartilhavel=1" if so_compartilhaveis else ""
+            sql = (
+                "SELECT m.* "
+                "FROM memorias_fts JOIN memorias AS m ON m.id=memorias_fts.rowid "
+                "WHERE memorias_fts MATCH ?" + filtro +
+                " ORDER BY bm25(memorias_fts) ASC, m.data DESC, m.id DESC LIMIT ?"
+            )
+            try:
+                linhas = self.db.execute(sql, (expressao, k)).fetchall()
+                return [dict(m) for m in linhas]
+            except sqlite3.OperationalError:
+                # Se o índice não puder ser consultado, mantém o comportamento anterior.
+                pass
+
         sql = "SELECT * FROM memorias" + (" WHERE compartilhavel=1" if so_compartilhaveis else "")
         candidatas = []
         for memoria in self.db.execute(sql):
